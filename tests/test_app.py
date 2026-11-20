@@ -293,3 +293,22 @@ def test_postgres_dialect_translation():
     assert to_pg("INSERT OR IGNORE INTO t (a) VALUES (?)") == "INSERT INTO t (a) VALUES (%s) ON CONFLICT DO NOTHING"
     assert "ON CONFLICT (key) DO UPDATE" in to_pg("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
     assert to_pg("SELECT 1 WHERE a LIKE ?") == "SELECT 1 WHERE a LIKE %s"
+
+
+def test_postgres_insert_returning_only_for_id_tables(monkeypatch):
+    import store
+    sent = []
+
+    class FakeCur:
+        description = None
+        rowcount = 1
+        def execute(self, q, a): sent.append(q)
+        def fetchall(self): return []
+
+    class FakeRaw:
+        def cursor(self): return FakeCur()
+    monkeypatch.setattr(store, "IS_PG", True)
+    c = store.Conn.__new__(store.Conn); c.raw = FakeRaw()
+    c.execute("INSERT INTO secrets (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", ("a", "b"))
+    c.execute("INSERT INTO events (ts, kind) VALUES (?, ?)", ("t", "k"))
+    assert "RETURNING" not in sent[0] and sent[1].endswith("RETURNING id")

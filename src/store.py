@@ -68,7 +68,7 @@ class Conn:
             return self.raw.execute(sql, args)
         q = to_pg(sql)
         m = _INSERT_TABLE.match(sql)
-        if m and m.group(1).lower() != "settings" and "RETURNING" not in q.upper():
+        if m and m.group(1).lower() not in ("settings", "secrets") and "RETURNING" not in q.upper():  # key-value tables have no id
             q += " RETURNING id"
         cur = self.raw.cursor()
         cur.execute(q, args)
