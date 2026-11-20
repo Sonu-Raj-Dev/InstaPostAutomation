@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS dm_deliveries (
 def migrate_pg():
     from store import get_db, ts
     with get_db() as c:
+        c.raw.execute("SELECT pg_advisory_xact_lock(727274)")  # serverless instances start in parallel; one migrates at a time
         for stmt in [x.strip() for x in PG_SCHEMA.split(";") if x.strip()]:
             c.raw.execute(stmt)
         for k, v in {**DEFAULTS, "theme_v4": "1", "ts_ist": "1"}.items():

@@ -73,10 +73,31 @@ def _valid_session(v: str) -> bool:
         return False
 
 
+_setup_tried = [0.0]
+
+
+def _retry_setup() -> bool:
+    """A failed start (e.g. DB not ready yet) is retried at most every 10 s instead of being remembered forever."""
+    global SETUP_ERROR
+    if time.time() - _setup_tried[0] < 10:
+        return False
+    _setup_tried[0] = time.time()
+    try:
+        from store import IS_PG as _pg
+        if os.getenv("VERCEL") and not _pg:
+            return False
+        migrate()
+        SETUP_ERROR = ""
+        return True
+    except Exception as e:
+        SETUP_ERROR = str(e)
+        return False
+
+
 @app.middleware("http")
 async def _auth(request: Request, call_next):
     path = request.url.path
-    if SETUP_ERROR and path.startswith("/api/"):
+    if SETUP_ERROR and path.startswith("/api/") and not _retry_setup():
         return JSONResponse(status_code=503, content={"error": f"Setup needed: {SETUP_ERROR}"})
     if path == "/" or path.startswith(OPEN_PATHS):
         return await call_next(request)
