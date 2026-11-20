@@ -20,23 +20,97 @@ from fastapi.staticfiles import StaticFiles
 SRC = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SRC))
 
-from config import CATEGORIES, ENV_PATH, OUTPUT_DIR  # noqa: E402
+from config import CATEGORIES, ON_VERCEL, OUTPUT_DIR  # noqa: E402
 from db.migrate_v2 import migrate  # noqa: E402
 
-migrate()
+SETUP_ERROR = ""
+try:
+    from store import IS_PG as _IS_PG
+    if os.getenv("VERCEL") and not _IS_PG:
+        raise RuntimeError("No database connected. In Vercel: Storage → Create/Connect a Postgres (Neon) database, then redeploy.")
+    migrate()
+except Exception as _e:  # surfaced by the auth middleware instead of a blank 500
+    SETUP_ERROR = str(_e)
 
 import workflow  # noqa: E402
 from automation.comment_responder import CommentResponder  # noqa: E402
 from generator import creative  # noqa: E402
 from scheduler import daily_runner  # noqa: E402
-from store import (execute, get_settings, log_event, now_ist, one, query, recover_stale_jobs,  # noqa: E402
-                   set_setting, start_job, ts)
+import media  # noqa: E402
+from store import (execute, get_secret, get_settings, log_event, now_ist, one, query, recover_stale_jobs,  # noqa: E402
+                   set_secret, set_setting, start_job, ts)
 
 STATIC = Path(__file__).resolve().parent / "static"
 app = FastAPI(title="SONU AI LAB")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 responder = CommentResponder()
 meta = workflow.meta
+
+
+# ------------------------------------------------------------------ login (required on Vercel)
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+OPEN_PATHS = ("/api/login", "/api/logout", "/api/health", "/api/webhooks/", "/api/cron/", "/static/")
+SESSION_DAYS = 30
+
+
+def _session_key() -> bytes:
+    return hashlib.sha256(f"session:{os.getenv('APP_SECRET') or APP_PASSWORD}".encode()).digest()
+
+
+def _make_session() -> str:
+    exp = str(int(time.time()) + SESSION_DAYS * 86400)
+    return exp + "." + hmac.new(_session_key(), exp.encode(), hashlib.sha256).hexdigest()
+
+
+def _valid_session(v: str) -> bool:
+    try:
+        exp, sig = v.split(".", 1)
+        return int(exp) > time.time() and hmac.compare_digest(sig, hmac.new(_session_key(), exp.encode(), hashlib.sha256).hexdigest())
+    except Exception:
+        return False
+
+
+@app.middleware("http")
+async def _auth(request: Request, call_next):
+    path = request.url.path
+    if SETUP_ERROR and path.startswith("/api/"):
+        return JSONResponse(status_code=503, content={"error": f"Setup needed: {SETUP_ERROR}"})
+    if path == "/" or path.startswith(OPEN_PATHS):
+        return await call_next(request)
+    if not APP_PASSWORD:
+        if ON_VERCEL:  # never run the cloud app without a login
+            return JSONResponse(status_code=503, content={"error": "Set APP_PASSWORD in the Vercel project environment variables."})
+        return await call_next(request)
+    if not _valid_session(request.cookies.get("sal_session", "")):
+        return JSONResponse(status_code=401, content={"error": "login required"})
+    return await call_next(request)
+
+
+@app.post("/api/login")
+async def api_login(req: Request):
+    pw = str((await body(req)).get("password", ""))
+    if not APP_PASSWORD or not hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+        time.sleep(1)  # slow down guessing
+        return JSONResponse(status_code=401, content={"error": "Wrong password"})
+    r = JSONResponse({"success": True})
+    r.set_cookie("sal_session", _make_session(), max_age=SESSION_DAYS * 86400, httponly=True,
+                 secure=req.url.scheme == "https" or ON_VERCEL, samesite="lax")
+    return r
+
+
+@app.post("/api/logout")
+def api_logout():
+    r = JSONResponse({"success": True})
+    r.delete_cookie("sal_session")
+    return r
+
+
+@app.get("/api/health")
+def api_health():
+    return {"ok": True, "cloud": ON_VERCEL, "login": bool(APP_PASSWORD)}
 
 
 @app.middleware("http")
@@ -50,6 +124,8 @@ async def _revalidate_static(request: Request, call_next):
 
 @app.on_event("startup")
 def _startup():
+    if ON_VERCEL:
+        return  # Vercel: Cron + webhooks replace the scheduler thread; jobs run inline
     recover_stale_jobs()
     if os.getenv("CMS_DISABLE_SCHEDULER") != "1":
         daily_runner.start_scheduler()
@@ -117,7 +193,7 @@ def api_state(refresh_meta: bool = False):
     s = get_settings()
     m = meta_status(refresh_meta)
     jobs = query("SELECT id, kind, trigger, status, stage, progress, started_at, finished_at, error FROM jobs ORDER BY id DESC LIMIT 12")
-    week = query("SELECT status FROM jobs WHERE started_at >= date('now','-7 day')")
+    week = query("SELECT status FROM jobs WHERE started_at >= ?", ((now_ist() - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d"),))
     ok = sum(j["status"] == "SUCCESS" for j in week)
     pend = one("SELECT AVG(quality_score) a FROM carousels WHERE status IN ('PENDING_APPROVAL','DRAFT') AND slide_data_json!=''")["a"]
     last_ok_research = one("SELECT finished_at FROM jobs WHERE kind='research' AND status='SUCCESS' ORDER BY id DESC LIMIT 1")
@@ -290,13 +366,11 @@ async def api_slide_image(cid: int, n: int, file: UploadFile = File(...)):
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
         raise ValueError("Upload a JPG, PNG, WEBP or GIF image")
     data = await file.read()
-    if len(data) > 8_000_000:
-        raise ValueError("Image too large (max 8 MB)")
-    d = workflow.carousel_dir(cid) / "assets"
-    d.mkdir(parents=True, exist_ok=True)
-    name = f"slide{n}_{int(time.time())}{ext}"
-    (d / name).write_bytes(data)
-    slides[n - 1]["image"] = f"/api/media/carousels/{cid}/assets/{name}"
+    limit = 3_000_000 if ON_VERCEL else 8_000_000  # Vercel request bodies max out around 4.5 MB
+    if len(data) > limit:
+        raise ValueError(f"Image too large (max {limit // 1_000_000} MB)")
+    ctype = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
+    slides[n - 1]["image"] = media.put(f"carousels/{cid}/assets/slide{n}_{int(time.time())}{ext}", data, ctype)
     return workflow.update_carousel(cid, {"slides": slides})
 
 
@@ -404,7 +478,8 @@ def api_system():
         gh = r.json().get("resources", {}).get("search") if r.ok else None
     except Exception:
         pass
-    return {"browser": creative.find_browser(), "github_token": bool(os.getenv("GITHUB_TOKEN")), "github_search_limit": gh,
+    return {"browser": "Serverless Chromium (api/render.js) + Vercel Blob" if ON_VERCEL else creative.find_browser(), "cloud": ON_VERCEL,
+            "webhook_url": f"{media._base()}/api/webhooks/instagram" if ON_VERCEL else "", "webhook_verify_token": webhook_token(), "github_token": bool(os.getenv("GITHUB_TOKEN")), "github_search_limit": gh,
             "llm_configured": bool(os.getenv("ANTHROPIC_API_KEY")), "db": str(workflow.OUTPUT_DIR.parent / "data"),
             "account_id": meta.ig_user_id, "meta_app_id": bool(meta.app_id), "meta_app_secret": bool(meta.app_secret)}
 
@@ -419,7 +494,7 @@ def api_meta_diagnostics():
 
 @app.post("/api/meta/token")
 async def api_meta_token(req: Request):
-    """Exchange a short-lived token for a 60-day token and store it in .env — only if it can read the configured account."""
+    """Exchange (when the app secret is set) and save a token — only if it can read the configured Instagram account."""
     token = str((await body(req)).get("token", "")).strip()
     if len(token) < 50:
         raise ValueError("Paste a Graph API user access token")
@@ -434,10 +509,8 @@ async def api_meta_token(req: Request):
     r = rq.get(f"https://graph.facebook.com/v22.0/{meta.ig_user_id}", params={"fields": "username", "access_token": new}, timeout=15)
     if r.status_code != 200:
         raise ValueError("This token cannot access the configured Instagram account — not saved.")
-    lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
-    lines = [ln for ln in lines if not ln.startswith("META_ACCESS_TOKEN=")] + [f"META_ACCESS_TOKEN={new}"]
-    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.environ["META_ACCESS_TOKEN"] = new
+    set_secret("meta_access_token", new)  # database, so it also works on Vercel (env vars are read-only there)
+    meta.reload()
     responder.reload()
     log_event("settings", f"Meta token renewed for @{r.json().get('username')}")
     d = meta_status(force=True)
@@ -571,6 +644,88 @@ async def api_scan(cid: int, req: Request):
         ctx.stage("Engagement: scanning comments", 20)
         return responder.scan_campaign(camp, dry_run=not live, log=ctx.log)
     return start_job("dm_scan", run, ref_id=cid, background=not b.get("wait"))
+
+
+# ------------------------------------------------------------------ Vercel Cron (daily research / build)
+def _cron_ok(req: Request) -> bool:
+    secret = os.getenv("CRON_SECRET", "")
+    return bool(secret) and hmac.compare_digest(req.headers.get("authorization", ""), f"Bearer {secret}")
+
+
+@app.get("/api/cron/{kind}")
+def api_cron(kind: str, request: Request):
+    if not _cron_ok(request):
+        return JSONResponse(status_code=401, content={"error": "Set CRON_SECRET in Vercel; cron requests must carry it"})
+    if kind == "research":
+        return start_job("research", workflow.run_research, trigger="cron", background=False)
+    if kind == "pipeline":
+        return start_job("pipeline", workflow.run_pipeline, trigger="cron", background=False)
+    if kind == "dm":  # optional: call every few minutes from an external cron as a backup to webhooks
+        set_setting("dm_last_poll", "")
+        return daily_runner.poll_dms()
+    raise HTTPException(404, "Unknown cron")
+
+
+# ------------------------------------------------------------------ Instagram webhooks (real-time comment-to-DM)
+def webhook_token() -> str:
+    t = get_secret("webhook_verify_token")
+    if not t:
+        t = hashlib.sha256(f"wh:{time.time()}:{os.urandom(8).hex()}".encode()).hexdigest()[:32]
+        set_secret("webhook_verify_token", t)
+    return t
+
+
+@app.get("/api/webhooks/instagram")
+def api_webhook_verify(request: Request):
+    q = request.query_params
+    if q.get("hub.mode") == "subscribe" and hmac.compare_digest(q.get("hub.verify_token", ""), webhook_token()):
+        return HTMLResponse(q.get("hub.challenge", ""))
+    return JSONResponse(status_code=403, content={"error": "verify token mismatch"})
+
+
+_wh_last: Dict[int, float] = {}
+
+
+@app.post("/api/webhooks/instagram")
+async def api_webhook(request: Request):
+    """Events only wake the app up; every action re-reads comments/messages from the Graph API itself,
+    so a forged event can't make it message anyone who didn't really comment."""
+    raw = await request.body()
+    secret = meta.app_secret
+    if secret:
+        sig = request.headers.get("x-hub-signature-256", "")
+        good = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, good):
+            return JSONResponse(status_code=403, content={"error": "bad signature"})
+    try:
+        data = json.loads(raw or b"{}")
+    except Exception:
+        return {"ok": True}
+    media_ids, senders = set(), set()
+    for e in data.get("entry", []):
+        for ch in e.get("changes", []):
+            if ch.get("field") in ("comments", "live_comments"):
+                media_ids.add(str(((ch.get("value") or {}).get("media") or {}).get("id", "")))
+        for m in e.get("messaging", []):
+            senders.add(str((m.get("sender") or {}).get("id", "")))
+    camps = query("SELECT * FROM campaigns WHERE active=1 AND media_id!=''")
+    todo = [c for c in camps if c["media_id"] in media_ids]
+    if senders:
+        ids = {r["campaign_id"] for r in query("SELECT campaign_id, igsid FROM dm_deliveries WHERE status IN ('AWAITING_TAP','AWAITING_FOLLOW')") if r["igsid"] in senders}
+        todo += [c for c in camps if c["id"] in ids and c not in todo]
+    responder.reload()
+    for c in todo:
+        if time.time() - _wh_last.get(c["id"], 0) < 3:
+            continue
+        _wh_last[c["id"]] = time.time()
+        try:
+            rep = responder.scan_campaign(c, dry_run=False, log=lambda *a: None)
+            n = len(rep.get("matches", [])) + sum(1 for f in rep.get("followups", []) if f.get("status"))
+            if n:
+                log_event("dm", f"Webhook: “{c['keyword']}” handled {n} action(s)", c["id"])
+        except Exception as e:
+            log_event("dm", f"Webhook scan failed for #{c['id']}: {e}", c["id"])
+    return {"ok": True}
 
 
 if __name__ == "__main__":

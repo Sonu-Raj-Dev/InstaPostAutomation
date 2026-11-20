@@ -115,7 +115,8 @@ def fetch_readme(url: str) -> Dict[str, List[str]]:
         elif re.match(r"^[-*] ", st) and len(out["features"]) < 6:
             f = re.sub(r"!\[[^\]]*\]\([^)]*\)|<[^>]+>", "", st[2:])        # images / html
             f = re.sub(r"\[([^\]]+)\]\([^)]*\)", lambda mm: mm.group(1), f)  # links -> text
-            f = re.sub(r"[*_`]+|^\[[ xX]\]\s*", "", f).strip(" :-")
+            f = re.sub(r"[*_`]+|^\[[ xX]\]\s*", "", f)
+            f = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+", "", f).strip(" :-")
             low = f.lower()
             skip = ("thank", "discord", "sponsor", "contributor", "star us", "wechat", "license", "integration")
             if 18 <= len(f) <= 110 and not low.startswith(("http", "see ", "check ")) \

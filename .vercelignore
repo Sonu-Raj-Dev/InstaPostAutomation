@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+data/
+output/
+backup_pre_redesign/
+docs/
+tests/
+.claude/
+__pycache__/
+*.db
+node_modules/

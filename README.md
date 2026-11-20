@@ -14,6 +14,20 @@ Slide rendering uses the installed Microsoft Edge or Chrome in headless mode (ov
 
 Tests: `python -m pytest tests -q`
 
+## Deploy to Vercel
+
+1. **vercel.com → Add New → Project → Import** `InstaPostAutomation` (no build settings needed; `vercel.json` covers it).
+2. In the project: **Storage → Create → Neon (Postgres)** and **Storage → Create → Blob**, connected to the project (adds `DATABASE_URL` and `BLOB_READ_WRITE_TOKEN`).
+3. **Settings → Environment Variables**:
+   - `APP_PASSWORD` — your login password (required)
+   - `CRON_SECRET` — any long random string (lets Vercel Cron run daily research/build)
+   - `INSTAGRAM_ACCOUNT_ID`, `META_APP_ID` (and `META_APP_SECRET` if you have it)
+4. **Redeploy**, open the URL, sign in, and paste your Meta token in **Settings** (stored in the database, not in env).
+5. Optional: copy your local data once — `set DATABASE_URL=...` then `python scripts/copy_to_cloud.py`.
+6. Real-time comment replies: **Settings → Cloud** shows the webhook URL + verify token to add in your Meta app (Webhooks → Instagram → `comments`, `messages`, `messaging_postbacks`).
+
+On Vercel: Postgres replaces SQLite, Vercel Blob stores images, `api/render.js` renders with serverless Chromium, Vercel Cron runs research (~17:30 IST) and the daily build (~19:00 IST), and Instagram webhooks trigger the comment-to-DM flow. Locally everything still runs on SQLite + headless Edge with no login.
+
 ## The simple flow (start here)
 
 1. **Create post** → pick one verified tool, or a **Pack** of 2–8 tools (“5 free AI video tools…”).

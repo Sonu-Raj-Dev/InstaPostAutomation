@@ -24,6 +24,15 @@ GRAPH_API_VERSION = "v22.0"
 GRAPH_BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
+def _saved_token() -> str:
+    """A token renewed from Settings is stored in the database (works on Vercel, where env vars are read-only)."""
+    try:
+        from store import get_secret
+        return get_secret("meta_access_token")
+    except Exception:
+        return ""
+
+
 class MetaGraphClient:
     def __init__(
         self,
@@ -231,7 +240,7 @@ class MetaGraphClient:
 
     def reload(self):
         load_dotenv(override=True)
-        self.access_token = os.getenv("META_ACCESS_TOKEN", "").strip()
+        self.access_token = (_saved_token() or os.getenv("META_ACCESS_TOKEN", "")).strip()
         self.ig_user_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "").strip()
 
     def diagnostics(self) -> Dict[str, Any]:

@@ -32,6 +32,10 @@ export async function api(path, opts = {}) {
   try { res = await fetch(path, init); } catch (e) { throw new Error("Server unreachable — is the app running?"); }
   const ct = res.headers.get("content-type") || "";
   const data = ct.includes("json") ? await res.json() : await res.text();
+  if (res.status === 401 && path !== "/api/login") {
+    window.dispatchEvent(new Event("auth-required"));
+    throw new Error("Please sign in");
+  }
   if (!res.ok) {
     const msg = (data && (data.error || data.detail)) || `Request failed (${res.status})`;
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));

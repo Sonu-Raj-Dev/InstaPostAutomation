@@ -42,7 +42,8 @@ class CommentResponder:
 
     def reload(self):
         load_dotenv(override=True)
-        self.access_token = os.getenv("META_ACCESS_TOKEN", "")
+        from meta_graph_client import _saved_token
+        self.access_token = _saved_token() or os.getenv("META_ACCESS_TOKEN", "")
         self.ig_user_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "")
 
     # ---------------------------------------------------------- Graph calls (overridden in tests)

@@ -124,7 +124,7 @@ def test_publish_failure_never_marks_published(monkeypatch):
 def test_publish_success_records_meta_ids(monkeypatch):
     cid = queued_post()
     monkeypatch.setattr(workflow.meta, "_get", lambda *a, **k: {"ok": True, "data": {"username": "tester"}})
-    monkeypatch.setattr(workflow, "upload_to_public_host", lambda p: "https://cdn.example/x.jpg")
+    monkeypatch.setattr(workflow.media, "public_url", lambda p: "https://cdn.example/x.jpg")
     monkeypatch.setattr(workflow.meta, "publish_carousel", lambda urls, cap: {"success": True, "post_id": "1790001"})
     monkeypatch.setattr(workflow.meta, "publish_single_image", lambda url, cap: {"success": True, "post_id": "1790001"})
     monkeypatch.setattr(workflow.meta, "get_permalink", lambda mid: "https://www.instagram.com/p/ABC123/")
@@ -252,3 +252,44 @@ def test_real_render_produces_instagram_jpgs():
     paths = creative.render_to_jpgs(creative.slide_document(slides, {}, "@h", "SONU AI LAB"), 2, TMP / "render", ["a.jpg", "b.jpg"])
     from PIL import Image
     assert [Image.open(p).size for p in paths] == [(1080, 1350), (1080, 1350)]
+
+
+# ---------------------------------------------------------------- cloud: login, cron, webhooks, Postgres dialect
+def test_login_protects_api(monkeypatch):
+    monkeypatch.setattr(webapp, "APP_PASSWORD", "s3cret-pass")
+    c = TestClient(webapp.app)
+    assert c.get("/api/state").status_code == 401
+    assert c.get("/api/health").status_code == 200 and c.get("/").status_code == 200
+    assert c.post("/api/login", json={"password": "nope"}).status_code == 401
+    assert c.post("/api/login", json={"password": "s3cret-pass"}).status_code == 200
+    assert c.get("/api/state").status_code == 200  # session cookie now set
+    c.post("/api/logout")
+    assert c.get("/api/state").status_code == 401
+
+
+def test_cron_needs_secret(monkeypatch):
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    assert client.get("/api/cron/research").status_code == 401
+    monkeypatch.setenv("CRON_SECRET", "abc")
+    assert client.get("/api/cron/research", headers={"authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_webhook_verify_and_wake(monkeypatch):
+    tok = webapp.webhook_token()
+    ok = client.get("/api/webhooks/instagram", params={"hub.mode": "subscribe", "hub.verify_token": tok, "hub.challenge": "42"})
+    assert ok.status_code == 200 and ok.text == "42"
+    assert client.get("/api/webhooks/instagram", params={"hub.mode": "subscribe", "hub.verify_token": "x", "hub.challenge": "42"}).status_code == 403
+    seen = []
+    monkeypatch.setattr(webapp.responder, "scan_campaign", lambda camp, dry_run, log: seen.append((camp["media_id"], dry_run)) or {"matches": [], "followups": []})
+    monkeypatch.setattr(webapp.responder, "reload", lambda: None)
+    monkeypatch.setattr(webapp.meta, "app_secret", "")
+    client.post("/api/campaigns", json={"name": "WH", "keyword": "HOOK", "media_id": "1790999", "resource_pack": "x", "active": True})
+    client.post("/api/webhooks/instagram", json={"object": "instagram", "entry": [{"changes": [{"field": "comments", "value": {"media": {"id": "1790999"}}}]}]})
+    assert ("1790999", False) in seen
+
+
+def test_postgres_dialect_translation():
+    from store import to_pg
+    assert to_pg("INSERT OR IGNORE INTO t (a) VALUES (?)") == "INSERT INTO t (a) VALUES (%s) ON CONFLICT DO NOTHING"
+    assert "ON CONFLICT (key) DO UPDATE" in to_pg("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    assert to_pg("SELECT 1 WHERE a LIKE ?") == "SELECT 1 WHERE a LIKE %s"

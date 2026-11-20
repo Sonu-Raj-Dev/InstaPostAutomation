@@ -10,6 +10,7 @@ export default {
       <div class="card" style="grid-column:1/-1"><div class="card-h"><h3>${icon("instagram")}Instagram connection</h3><button class="btn sm" id="diag">${icon("stethoscope")}Run diagnostics</button></div><div class="card-b" id="conn"><div class="skel" style="height:120px"></div></div></div>
       <div class="card" style="grid-column:1/-1"><div class="card-h"><h3>${icon("message-circle-heart")}Comment auto-reply</h3><span class="dim" style="font-size:12px" id="dmState"></span></div><div class="card-b"><form class="stack" id="dmf" novalidate></form></div></div>
       <div class="card"><div class="card-h"><h3>${icon("palette")}Visual identity & defaults</h3></div><div class="card-b"><form class="stack" id="ident" novalidate></form></div></div>
+      <div class="card" id="cloudCard" hidden style="grid-column:1/-1"><div class="card-h"><h3>${icon("cloud")}Cloud: real-time comment replies</h3><button class="btn sm" id="logout">${icon("log-out")}Sign out</button></div><div class="card-b stack" id="cloudBody"></div></div>
       <div class="card"><div class="card-h"><h3>${icon("cpu")}Engines, research & cost controls</h3></div><div class="card-b stack" id="sys"><div class="skel" style="height:160px"></div></div></div>
     </div>`);
 
@@ -97,6 +98,14 @@ export default {
     };
 
     api("/api/system").then((x) => {
+      if (x.cloud) {
+        $("#cloudCard").hidden = false;
+        mount($("#cloudBody"), html`<p class="muted" style="margin:0">So comments get answered instantly, point Instagram webhooks at this app. In <b>developers.facebook.com → your app → Webhooks → Instagram</b>, set:</p>
+          <dl class="kv"><dt>Callback URL</dt><dd class="mono">${x.webhook_url}</dd><dt>Verify token</dt><dd class="mono">${x.webhook_verify_token}</dd>
+          <dt>Subscribe to</dt><dd class="mono">comments, messages, messaging_postbacks</dd></dl>
+          <p class="dim" style="margin:0;font-size:12.5px">Daily research (≈17:30 IST) and build (≈19:00 IST) run from Vercel Cron; on the free plan they fire within that hour.</p>`);
+        $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.reload(); };
+      }
       const gl = x.github_search_limit;
       mount($("#sys"), html`
         <dl class="kv">

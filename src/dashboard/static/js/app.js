@@ -114,6 +114,30 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
+
+// ---------------------------------------------------------------- login (cloud)
+let loginShown = false;
+window.addEventListener("auth-required", () => {
+  if (loginShown) return;
+  loginShown = true;
+  const el = document.createElement("div");
+  el.className = "scrim";
+  el.style.background = "rgba(4,6,13,.97)";
+  mount(el, html`<form class="modal" style="width:min(380px,100%)" id="loginForm">
+    <div class="modal-h" style="justify-content:center;text-align:center;display:grid;gap:10px">
+      <svg class="brand-mark" viewBox="0 0 34 34" style="width:44px;height:44px;margin:0 auto" aria-hidden="true"><use href="#mark"/></svg>
+      <h3>SONU AI LAB</h3><p class="dim" style="margin:0;font-size:13px">Sign in to manage your Instagram automation</p></div>
+    <div class="modal-b"><label class="field"><span>Password</span><input class="input" type="password" name="pw" autocomplete="current-password" required autofocus></label>
+      <p class="err" id="loginErr" style="color:var(--err);font-size:12.5px;margin:8px 0 0"></p></div>
+    <div class="modal-f"><button class="btn primary" style="width:100%" type="submit">Sign in</button></div></form>`);
+  document.body.append(el);
+  el.querySelector("input").focus();
+  el.querySelector("form").onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api("/api/login", { method: "POST", body: { password: e.target.pw.value } }); location.reload(); }
+    catch (err) { el.querySelector("#loginErr").textContent = err.message; }
+  };
+});
 $("#navToggle").addEventListener("click", () => document.body.classList.toggle("nav-open"));
 document.addEventListener("click", (e) => { if (document.body.classList.contains("nav-open") && !e.target.closest(".side, #navToggle")) document.body.classList.remove("nav-open"); });
 

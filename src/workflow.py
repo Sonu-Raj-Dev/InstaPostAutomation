@@ -11,7 +11,8 @@ from meta_graph_client import MetaGraphClient
 from qc.evaluator import QualityControlEvaluator
 from research.harvester import ResearchHarvester, recommend_format
 from store import execute, get_setting, get_settings, log_event, now_ist, one, query, ts
-from utils.media_uploader import upload_to_public_host
+import media
+from config import ON_VERCEL
 
 meta = MetaGraphClient()
 harvester = ResearchHarvester()
@@ -41,9 +42,12 @@ def load_carousel(cid: int) -> Optional[Dict[str, Any]]:
     c["pack_topics"] = [topic_dict(t) for t in c["slide_data"].get("pack", [])]
     slides = c["slide_data"].get("slides", [])
     d = carousel_dir(cid)
-    c["guide"] = [f"/api/media/carousels/{cid}/{p.name}" for p in sorted(d.glob("guide_*.jpg"))] if d.exists() else []
-    c["rendered"] = [f"/api/media/carousels/{cid}/slide_{i:02d}.jpg" for i in range(1, len(slides) + 1)
-                     if (d / f"slide_{i:02d}.jpg").exists()]
+    c["rendered"] = json.loads(c.get("rendered_json") or "[]")
+    c["guide"] = json.loads(c.get("guide_json") or "[]")
+    if not c["rendered"] and not ON_VERCEL and d.exists():  # posts rendered before URLs were stored
+        c["guide"] = [f"/api/media/carousels/{cid}/{p.name}" for p in sorted(d.glob("guide_*.jpg"))]
+        c["rendered"] = [f"/api/media/carousels/{cid}/slide_{i:02d}.jpg" for i in range(1, len(slides) + 1)
+                         if (d / f"slide_{i:02d}.jpg").exists()]
     c["render_stale"] = not c["rendered"] or len(c["rendered"]) != len(slides) or (c.get("rendered_at") or "") < (c.get("updated_at") or "")
     c["legacy"] = not slides  # rows created before v3 have no slide data
     return c
@@ -191,25 +195,18 @@ def render(cid: int, only: Optional[int] = None, ctx=None) -> Dict[str, Any]:
     slides = c["slide_data"]["slides"]
     if ctx:
         ctx.stage("Visual Creation", 30)
-    names = [f"slide_{only:02d}.jpg"] if only else [f"slide_{i:02d}.jpg" for i in range(1, len(slides) + 1)]
-    out = carousel_dir(cid)
-    if not only:
-        for old in out.glob("slide_*.jpg"):
-            old.unlink()
-    paths = creative.render_to_jpgs(slide_html(c, only, for_render=True), len(names), out, names)
-    if not only:
-        if ctx:
-            ctx.stage("Visual Creation: DM guide", 70)
-        for old in out.glob("guide_*.jpg"):
-            old.unlink()
-        doc, pages = guide_html(c)
-        doc = doc.replace('referrerpolicy="no-referrer">', 'referrerpolicy="no-referrer" onerror="this.parentNode.remove()">')
-        creative.render_to_jpgs(doc, pages, out, [f"guide_{i:02d}.jpg" for i in range(1, pages + 1)])
-        execute("UPDATE carousels SET rendered_at=? WHERE id=?", (ts(), cid))
+    prefix = f"carousels/{cid}"
+    urls = media.render(slide_html(c, for_render=True), [f"slide_{i:02d}.jpg" for i in range(1, len(slides) + 1)], prefix)
     if ctx:
-        ctx.log(f"Rendered {len(paths)} slide(s) for #{cid}")
-    log_event("creative", f"Rendered {len(paths)} slide(s) for draft #{cid}", cid)
-    return {"success": True, "rendered": [p.name for p in paths]}
+        ctx.stage("Visual Creation: DM guide", 70)
+    doc, pages = guide_html(c)
+    doc = doc.replace('referrerpolicy="no-referrer">', 'referrerpolicy="no-referrer" onerror="this.parentNode.remove()">')
+    guide = media.render(doc, [f"guide_{i:02d}.jpg" for i in range(1, pages + 1)], prefix)
+    execute("UPDATE carousels SET rendered_json=?, guide_json=?, rendered_at=? WHERE id=?", (json.dumps(urls), json.dumps(guide), ts(), cid))
+    if ctx:
+        ctx.log(f"Rendered {len(urls)} slide(s) + {len(guide)} guide page(s) for #{cid}")
+    log_event("creative", f"Rendered {len(urls)} slide(s) for draft #{cid}", cid)
+    return {"success": True, "rendered": urls, "guide": guide}
 
 
 def regenerate(cid: int, slide_index: Optional[int] = None, count: Optional[int] = None) -> Dict[str, Any]:
@@ -271,7 +268,7 @@ def publish(cid: int, ctx=None) -> Dict[str, Any]:
         return {"success": False, "error": f"Only approved-queue posts can be published (status {c['status']})"}
     if c["render_stale"]:
         return {"success": False, "error": "Slides changed since last render — render before publishing"}
-    files = sorted(carousel_dir(cid).glob("slide_*.jpg"))
+    files = c["rendered"]
     if not 1 <= len(files) <= 10:
         return {"success": False, "error": f"{len(files)} rendered slides; Instagram needs 1–10"}
 
@@ -289,12 +286,12 @@ def publish(cid: int, ctx=None) -> Dict[str, Any]:
     execute("UPDATE carousels SET status='PUBLISHING', error_message='' WHERE id=?", (cid,))
     step("Instagram Publishing: staging images", 30)
     urls = []
-    for f in files:
-        u = upload_to_public_host(str(f))
+    for i, f in enumerate(files, 1):
+        u = media.public_url(f)
         if not u:
-            return fail(f"Could not stage {f.name} on a public HTTPS host")
+            return fail(f"Could not stage slide {i} on a public HTTPS host")
         urls.append(u)
-        log(f"Staged {f.name}")
+        log(f"Slide {i}: {u[:80]}")
     caption = f"{c['caption']}\n\n{c.get('hashtags', '')}".strip()
     step("Instagram Publishing: creating containers", 60)
     res = meta.publish_single_image(urls[0], caption) if len(urls) == 1 else meta.publish_carousel(urls, caption)
@@ -317,8 +314,8 @@ def auto_campaign(cid: int, media_id: str, log=lambda *a: None) -> Optional[int]
     c = load_carousel(cid)
     s = get_settings()
     urls = []
-    for f in sorted(carousel_dir(cid).glob("guide_*.jpg"))[:6]:
-        u = upload_to_public_host(str(f))
+    for f in c["guide"][:6]:
+        u = media.public_url(f)
         if u:
             urls.append(u)
     log(f"Guide pages staged for DM: {len(urls)}")
