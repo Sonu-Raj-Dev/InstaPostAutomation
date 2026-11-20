@@ -1,0 +1,14 @@
+# secrets
+.env
+# local data, generated media, backups
+data/
+output/
+backup_pre_redesign/
+*.db
+# tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.claude/
+.vscode/
+.idea/
