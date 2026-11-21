@@ -1,9 +1,8 @@
 """Daily automation: in-process scheduler (Asia/Kolkata) + CLI entry point.
 
-* research_time        → research job
-* target_publish_time  → pipeline job (Review Mode: queue for approval; Auto Mode: publish if QC passes)
-A slot fires once per day, and only within GRACE minutes of its time, so restarting the server late
-never triggers a stale run.
+Production (Vercel) is driven by QStash schedules (scheduler/qstash_schedules.py); this module is the local
+in-process clock and the fallback tick. Both run the same independent jobs from scheduler/jobs.py:
+research · generate · publish_due · analytics · maintenance. Comment-to-DM is event-driven and not scheduled here.
 """
 
 import json
@@ -16,48 +15,43 @@ from typing import Any, Dict, Optional
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from store import get_setting, get_settings, now_ist, set_setting, start_job  # noqa: E402
+from store import get_setting, get_settings, now_ist, recover_stale_jobs, set_setting, start_job  # noqa: E402
 import workflow  # noqa: E402
 
-GRACE = timedelta(minutes=30)
-SLOTS = [("research", "research_time", workflow.run_research), ("pipeline", "target_publish_time", workflow.run_pipeline)]
-
-
-def _at(hhmm: str, day: datetime) -> Optional[datetime]:
-    try:
-        h, m = map(int, hhmm.split(":")[:2])
-        return day.replace(hour=h, minute=m, second=0, microsecond=0)
-    except Exception:
-        return None
+GRACE = timedelta(minutes=30)  # a daily job only starts within 30 min of its time (a late restart never runs a stale job)
 
 
 def next_runs() -> Dict[str, str]:
-    s, now = get_settings(), now_ist()
-    out = {}
-    for kind, key, _ in SLOTS:
-        t = _at(s.get(key, ""), now)
-        if t is None:
-            continue
-        done_today = s.get(f"last_{kind}_slot") == now.strftime("%Y-%m-%d")
-        if t <= now or done_today:
-            t += timedelta(days=1)
-        out[kind] = t.isoformat()
+    from scheduler import jobs
+    out = jobs.next_runs()
+    out["pipeline"] = out.get("generate", "")  # older dashboard label ("next build")
     return out
 
 
 def tick(now: Optional[datetime] = None) -> list:
-    """Start any slot that is due. Returns the kinds started (used by tests)."""
+    """Local in-process scheduler / Vercel fallback (/api/cron/tick). Runs the same split jobs QStash triggers in production:
+    housekeeping, each daily job inside its window (retried with backoff), and publish_due when an approved post is due.
+    Returns the kinds started (used by tests)."""
+    from scheduler import jobs
     s, now = get_settings(), now or now_ist()
+    try:  # housekeeping on every tick: orphaned jobs, posts stuck in Publishing, undelivered webhook events
+        recover_stale_jobs(15)
+        workflow.recover_stuck_publishing()
+        from automation import webhook_inbox
+        webhook_inbox.sweep()
+    except Exception as e:
+        print(f"[scheduler] recovery: {e}")
     if s.get("scheduler_enabled", "1") != "1":
         return []
     started = []
-    for kind, key, fn in SLOTS:
-        t = _at(s.get(key, ""), now)
-        today = now.strftime("%Y-%m-%d")
-        if t and t <= now < t + GRACE and s.get(f"last_{kind}_slot") != today:
-            set_setting(f"last_{kind}_slot", today)
-            if start_job(kind, fn, trigger="scheduled")["started"]:
-                started.append(kind)
+    for kind in jobs.due_daily(now, GRACE):
+        code, res = jobs.run(kind, trigger="scheduled", now=now)
+        if "skipped" not in res:
+            started.append(kind)
+    if workflow.due_post():
+        code, res = jobs.run("publish_due", trigger="scheduled", now=now)
+        if "skipped" not in res:
+            started.append("publish_due")
     return started
 
 

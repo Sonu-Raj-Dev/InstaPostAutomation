@@ -1,8 +1,8 @@
-import { $, api, badge, barList, busy, confirmDialog, emptyState, html, icon, modal, mount, rel, toast } from "../ui.js";
+import { $, api, badge, barList, busy, confirmDialog, emptyState, html, icon, ist, modal, mount, rel, toast } from "../ui.js";
 
-const BLANK = { name: "", keyword: "AGENT", media_id: "", carousel_id: null, private_reply: "Here's what you asked for 👇", follow_gate: 1,
+const BLANK = { name: "", keyword: "AGENT", keywords: "", guide_url: "", media_id: "", carousel_id: null, private_reply: "Here's what you asked for 👇", follow_gate: 1,
   follow_gate_message: "Thanks for the comment! Follow the account, then reply DONE here and I'll send the links.", resource_pack: "", public_reply_enabled: 0, public_reply_text: "", active: 0 };
-const ORDER = ["RESOURCE_SENT", "AWAITING_REPLY", "NOT_FOLLOWING", "FAILED", "MATCHED", "LEGACY_PROCESSED"];
+const ORDER = ["RESOURCE_SENT", "AWAITING_TAP", "AWAITING_FOLLOW", "AWAITING_REPLY", "NOT_FOLLOWING", "UNCERTAIN", "FAILED", "SKIPPED_DUPLICATE_USER", "SKIPPED_SELF", "SKIPPED_EXPIRED", "MATCHED", "LEGACY_PROCESSED"];
 
 export default {
   title: "Comment-to-DM",
@@ -19,7 +19,23 @@ export default {
           <div class="notice info">${icon("info")}<div><b>Follower status can't be read from a comment.</b> It's only available after the person messages you; until then deliveries show “Awaiting DM reply”.</div></div>
           <div class="notice info">${icon("shield")}<div>One private reply per comment (within 7 days). Follow-ups only inside the 24-hour window after they reply. Public replies stay off unless a campaign enables them.</div></div>
         </div></div></div>
-      <div class="dm-grid"><div class="stack" id="clist"></div><div id="editor"></div></div>`);
+      <div class="dm-grid"><div class="stack" id="clist"></div><div id="editor"></div></div>
+      <div class="card" style="margin-top:16px"><div class="card-h"><h3>${icon("activity")}Incoming webhook events</h3><span class="dim" style="font-size:12px">Real events received from Meta (newest first)</span></div>
+        <div class="card-b"><div class="table-wrap"><table class="table"><thead><tr><th>Received</th><th>Type</th><th>From</th><th>Text</th><th>Status</th><th></th></tr></thead><tbody id="evs"><tr><td colspan="6"><div class="skel" style="height:40px"></div></td></tr></tbody></table></div></div></div>`);
+    const loadEvents = async () => {
+      try {
+        const r = await api("/api/inbox/events?limit=30");
+        mount($("#evs"), r.events.length ? html`${r.events.map((e) => html`<tr><td class="dim" title="${ist(e.received_at)}">${rel(e.received_at)}</td><td>${e.kind}</td><td>${e.sender_username ? "@" + e.sender_username : html`<span class="dim">—</span>`}</td>
+            <td style="max-width:280px">${e.text || html`<span class="dim">—</span>`}</td><td>${badge(e.status)}${e.attempts > 1 ? html` <span class="dim" style="font-size:11px">×${e.attempts}</span>` : ""}${e.error ? html`<div style="color:var(--err);font-size:11.5px;margin-top:4px">${e.error.slice(0, 160)}</div>` : ""}</td>
+            <td>${e.status === "FAILED" ? html`<button class="btn sm" data-evretry="${e.id}">${icon("refresh-ccw")}Retry</button>` : ""}</td></tr>`)}`
+          : html`<tr><td colspan="6">${emptyState("activity", "No webhook events yet", r.app_secret_configured ? "Once Meta is subscribed, every comment on your posts appears here within seconds." : "META_APP_SECRET isn't set, so incoming webhooks are rejected. Add it in Vercel first.")}</td></tr>`);
+      } catch (err) { mount($("#evs"), html`<tr><td colspan="6" class="dim">${err.message}</td></tr>`); }
+    };
+    $("#evs").onclick = (e) => {
+      const b = e.target.closest("[data-evretry]");
+      if (b) busy(b, async () => { const r = await api(`/api/inbox/events/${b.dataset.evretry}/retry`, { method: "POST" }); toast(r.ok ? "Event re-queued" : r.error, r.ok ? "ok" : "err"); loadEvents(); });
+    };
+    loadEvents();
 
     const load = async () => {
       [camps, published] = await Promise.all([api("/api/campaigns"), api("/api/carousels?status=PUBLISHED")]);
@@ -29,7 +45,7 @@ export default {
     };
     const drawList = () => mount($("#clist"), camps.length ? html`${camps.map((c) => html`<button class="queue-item ${c.id === sel ? "on" : ""}" data-id="${c.id}" style="grid-template-columns:1fr">
         <div><div class="spread"><b>${c.name}</b>${c.active ? html`<span class="chip live"><span class="dot"></span>Active</span>` : html`<span class="chip">Paused</span>`}</div>
-        <div class="row" style="margin-top:8px;gap:6px"><span class="chip info mono">${c.keyword}</span><span class="dim" style="font-size:12px">${c.stats.RESOURCE_SENT || 0} sent · ${c.stats.AWAITING_REPLY || 0} waiting · ${c.stats.FAILED || 0} failed</span></div></div></button>`)}`
+        <div class="row" style="margin-top:8px;gap:6px">${[c.keyword, ...(c.keywords ? c.keywords.split(",") : [])].map((k) => html`<span class="chip info mono">${k}</span>`)}<span class="dim" style="font-size:12px">${c.stats.RESOURCE_SENT || 0} sent · ${c.stats.AWAITING_REPLY || 0} waiting · ${c.stats.FAILED || 0} failed</span></div></div></button>`)}`
       : html`<div class="card">${emptyState("message-circle-heart", "No campaigns", "Create a campaign for a published post: keyword → private reply → resource pack.")}</div>`);
 
     const edit = async (c) => {
@@ -42,6 +58,9 @@ export default {
           <div class="grid" style="grid-template-columns:2fr 1fr">
             <label class="field"><span>Campaign name</span><input class="input" name="name" value="${d.name}" required maxlength="80" placeholder="e.g. Concat repo pack"></label>
             <label class="field"><span>Trigger keyword</span><input class="input mono" name="keyword" value="${d.keyword}" required maxlength="20" placeholder="AGENT"></label></div>
+          <div class="grid" style="grid-template-columns:1fr 1fr">
+            <label class="field"><span>Extra keywords</span><input class="input mono" name="keywords" value="${d.keywords || ""}" maxlength="220" placeholder="GUIDE, LINK"><small>Comma separated. Case doesn't matter: agent = AGENT.</small></label>
+            <label class="field"><span>Guide link</span><input class="input" name="guide_url" value="${d.guide_url || ""}" maxlength="500" placeholder="https://…"><small>Added to the guide DM. Use {guide_url} in messages to place it yourself.</small></label></div>
           <div class="row" style="gap:6px"><span class="dim" style="font-size:12px">Ideas:</span>${["AGENT", "REPO", "VIDEO", "EDIT", "PROMPT"].map((k) => html`<button type="button" class="chip" data-kw="${k}" style="cursor:pointer">${k}</button>`)}</div>
           <div class="grid" style="grid-template-columns:1fr 1fr">
             <label class="field"><span>Associated post</span><select class="select" name="carousel_id"><option value="">— Manual media id —</option>${published.filter((p) => p.ig_media_id || p.metricool_post_id).map((p) => html`<option value="${p.id}" ${d.carousel_id === p.id ? "selected" : ""}>#${p.id} · ${p.headline.slice(0, 48)}</option>`)}</select></label>
@@ -57,7 +76,7 @@ export default {
             ${c ? html`<button type="button" class="btn" id="dry">${icon("scan-eye")}Preview scan (no messages)</button><button type="button" class="btn danger" id="live" ${c.active ? "" : "disabled title='Activate the campaign first'"}>${icon("send")}Run live scan</button>` : ""}</div>
         </form>
         ${c ? html`<div><div class="label" style="margin-bottom:10px">Delivery breakdown</div>${barList(ORDER.filter((k) => stats[k]).map((k) => ({ label: k.replace(/_/g, " ").toLowerCase(), value: stats[k] })))}</div>
-          <div><div class="label" style="margin-bottom:10px">Deliveries</div><div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Comment</th><th>Status</th><th>Follower</th><th>Updated</th></tr></thead><tbody id="dl"><tr><td colspan="5"><div class="skel" style="height:40px"></div></td></tr></tbody></table></div></div>` : ""}
+          <div><div class="label" style="margin-bottom:10px">Deliveries</div><div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Comment</th><th>Status</th><th>Follower</th><th>Updated</th><th></th></tr></thead><tbody id="dl"><tr><td colspan="6"><div class="skel" style="height:40px"></div></td></tr></tbody></table></div></div>` : ""}
       </div></div>`);
       const f = $("#cform");
       f.onclick = (e) => { const k = e.target.closest("[data-kw]"); if (k) f.keyword.value = k.dataset.kw; };
@@ -71,7 +90,7 @@ export default {
       };
       f.onsubmit = async (e) => {
         e.preventDefault();
-        const body = { name: f.name.value.trim(), keyword: f.keyword.value.trim(), media_id: f.media_id.value.trim(), carousel_id: f.carousel_id.value ? +f.carousel_id.value : null,
+        const body = { name: f.name.value.trim(), keyword: f.keyword.value.trim(), keywords: f.keywords.value.trim(), guide_url: f.guide_url.value.trim(), media_id: f.media_id.value.trim(), carousel_id: f.carousel_id.value ? +f.carousel_id.value : null,
           private_reply: f.private_reply.value, follow_gate: f.follow_gate.checked, follow_gate_message: f.follow_gate_message.value, resource_pack: f.resource_pack.value,
           public_reply_enabled: f.public_reply_enabled.checked, public_reply_text: f.public_reply_text.value, active: f.active.checked };
         if (!body.name || !body.keyword) return toast("Name and keyword are required", "err");
@@ -85,8 +104,25 @@ export default {
         });
       };
       if (!c) return;
-      api(`/api/campaigns/${c.id}/deliveries`).then((rows) => mount($("#dl"), rows.length ? html`${rows.map((r) => html`<tr><td>${r.username ? "@" + r.username : html`<span class="dim">—</span>`}</td><td style="max-width:260px">${r.comment_text || html`<span class="dim mono">${r.comment_id}</span>`}</td><td>${badge(r.status)}${r.error ? html`<div style="color:var(--err);font-size:11.5px;margin-top:4px">${r.error.slice(0, 140)}</div>` : ""}</td><td>${r.follower_status}</td><td class="dim">${rel(r.updated_at || r.created_at)}</td></tr>`)}`
-        : html`<tr><td colspan="5">${emptyState("inbox", "No deliveries yet", "Run a preview scan to see which comments match.")}</td></tr>`));
+      api(`/api/campaigns/${c.id}/deliveries`).then((rows) => mount($("#dl"), rows.length ? html`${rows.map((r) => html`<tr><td>${r.username ? "@" + r.username : html`<span class="dim">—</span>`}</td><td style="max-width:260px">${r.comment_text || html`<span class="dim mono">${r.comment_id}</span>`}</td><td>${badge(r.status)}${r.error ? html`<div style="color:var(--err);font-size:11.5px;margin-top:4px">${r.error.slice(0, 140)}</div>` : ""}</td><td>${r.follower_status}</td><td class="dim">${rel(r.updated_at || r.created_at)}</td>
+          <td style="white-space:nowrap"><button class="btn sm ghost" data-log="${r.id}">${icon("history")}History</button>${["FAILED", "UNCERTAIN"].includes(r.status) ? html`<button class="btn sm" data-retry="${r.id}" data-st="${r.status}">${icon("refresh-ccw")}Retry</button>` : ""}</td></tr>`)}`
+        : html`<tr><td colspan="6">${emptyState("inbox", "No deliveries yet", "Run a preview scan to see which comments match.")}</td></tr>`));
+      $("#dl").onclick = async (e) => {
+        const lg = e.target.closest("[data-log]"), rt = e.target.closest("[data-retry]");
+        if (lg) {
+          const rows = await api(`/api/deliveries/${lg.dataset.log}/log`);
+          return modal({ title: "Delivery history", body: rows.length ? html`<table class="table"><thead><tr><th>When (UTC)</th><th>Step</th><th>Result</th></tr></thead><tbody>${rows.map((x) => html`<tr><td class="mono dim">${x.at.replace("T", " ").replace("Z", "")}</td><td>${x.step.replace(/_/g, " ")}</td><td>${x.ok ? badge("OK") : badge("FAILED")} <span style="font-size:12px">${x.detail}</span></td></tr>`)}</tbody></table>` : html`<p class="dim">No history recorded for this delivery (it predates delivery history).</p>` });
+        }
+        if (rt) {
+          const unc = rt.dataset.st === "UNCERTAIN";
+          if (!(await confirmDialog("Retry this private reply?", unc ? "Meta never confirmed the first attempt, so this person MAY already have it. Retrying could send a second message." : "Sends one private reply for this comment again. Meta allows replies only within 7 days of the comment.", "Retry", unc ? "danger" : "primary"))) return;
+          await busy(rt, async () => {
+            const r = await api(`/api/deliveries/${rt.dataset.retry}/retry`, { method: "POST", body: { confirm_uncertain: unc } });
+            toast(r.ok ? "Private reply sent" : `Retry failed: ${r.error}`, r.ok ? "ok" : "err", 9000);
+            await load();
+          });
+        }
+      };
       const scan = async (live, btn) => {
         await busy(btn, async () => {
           try {

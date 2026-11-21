@@ -119,6 +119,9 @@ export const STATUS = {
   RUNNING: ["Running", "live"], SUCCESS: ["Success", "ok"], FAILED: ["Failed", "err"],
   RESOURCE_SENT: ["Resource sent", "ok"], AWAITING_REPLY: ["Awaiting DM reply", "warn"], NOT_FOLLOWING: ["Not following", ""],
   MATCHED: ["Matched", "info"], SKIPPED_SELF: ["Your own comment", ""], AWAITING_TAP: ["Waiting for button tap", "warn"], AWAITING_FOLLOW: ["Waiting for follow", "warn"], LEGACY_PROCESSED: ["Handled (legacy)", ""],
+  SENDING: ["Sending…", "live"], DELIVERING: ["Delivering…", "live"], UNCERTAIN: ["Not confirmed by Meta", "warn"], OK: ["OK", "ok"],
+  SKIPPED_DUPLICATE_USER: ["Already served", ""], SKIPPED_EXPIRED: ["Older than 7 days", ""],
+  PENDING: ["Pending", "warn"], QUEUED: ["Queued", "info"], PROCESSING: ["Processing", "live"], PROCESSED: ["Processed", "ok"], IGNORED: ["Ignored", ""],
 };
 export const badge = (s) => { const [l, k] = STATUS[s] || [s, ""]; return html`<span class="chip ${k}"><span class="dot"></span>${l}</span>`; };
 

@@ -37,6 +37,10 @@ from automation.comment_responder import CommentResponder  # noqa: E402
 from generator import creative  # noqa: E402
 from scheduler import daily_runner  # noqa: E402
 import media  # noqa: E402
+import qstash_client  # noqa: E402
+from scheduler import jobs as sched_jobs, qstash_schedules  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from automation import webhook_inbox  # noqa: E402
 from store import (execute, get_secret, get_settings, log_event, now_ist, one, query, recover_stale_jobs,  # noqa: E402
                    set_secret, set_setting, start_job, ts)
 
@@ -52,7 +56,7 @@ import hashlib  # noqa: E402
 import hmac  # noqa: E402
 
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-OPEN_PATHS = ("/api/login", "/api/logout", "/api/health", "/api/webhooks/", "/api/cron/", "/static/")
+OPEN_PATHS = ("/api/login", "/api/logout", "/api/health", "/api/webhooks/", "/api/cron/", "/api/queue/", "/static/")  # webhooks/queue/cron verify their own signatures
 SESSION_DAYS = 30
 
 
@@ -411,9 +415,20 @@ async def api_publish(cid: int, req: Request):
     if not b.get("confirm"):
         raise ValueError("Publishing requires explicit confirmation")
     c = _c(cid)
-    if c["status"] not in ("PENDING_APPROVAL", "PUBLISH_FAILED"):
+    if c["status"] not in ("PENDING_APPROVAL", "PUBLISH_FAILED", "PUBLISHING"):  # PUBLISHING: publish() reconciles or refuses
         raise ValueError(f"Only posts in the approval queue can be published (status {c['status']})")
+    recover_stale_jobs(15)
     return start_job("publish", lambda ctx: workflow.publish(cid, ctx), ref_id=cid)
+
+
+@app.post("/api/carousels/{cid}/reconcile")
+def api_reconcile(cid: int):
+    """'Check status' for a post stuck in Publishing: asks Meta whether it went live. Never publishes."""
+    _c(cid)
+    recover_stale_jobs(15)
+    res = workflow.recover_stuck_publishing(cid)
+    note = None if res else f"Still within the {workflow.STUCK_AFTER_MIN}-minute window of an active publish. Check again shortly."
+    return {"results": res, "note": note, "carousel": workflow.load_carousel(cid)}
 
 
 @app.get("/api/media/{path:path}")
@@ -442,6 +457,8 @@ VALIDATORS = {
     "publishing_mode": lambda v: v in ("REVIEW", "AUTO"),
     "target_publish_time": lambda v: bool(TIME_RE.match(v)),
     "research_time": lambda v: bool(TIME_RE.match(v)),
+    "generate_time": lambda v: v == "" or bool(TIME_RE.match(v)),   # "" = automatic (45 min before publishing)
+    "analytics_time": lambda v: bool(TIME_RE.match(v)),
     "min_qc_score": lambda v: v.isdigit() and 0 <= int(v) <= 100,
     "max_posts_per_day": lambda v: v.isdigit() and 1 <= int(v) <= 5,
     "max_research_items": lambda v: v.isdigit() and 5 <= int(v) <= 100,
@@ -486,7 +503,168 @@ async def api_update_settings(req: Request):
         if k != "confirm_auto":
             set_setting(k, str(v).strip())
     log_event("settings", "Updated " + ", ".join(k for k in b if k != "confirm_auto"))
-    return {"success": True, "settings": get_settings()}
+    out = {"success": True, "settings": get_settings()}
+    if SCHEDULE_KEYS & set(b) and qstash_client.configured():  # times changed → replace the QStash schedules
+        out["schedule_sync"] = qstash_schedules.sync()
+    return out
+
+
+SCHEDULE_KEYS = {"research_time", "generate_time", "target_publish_time", "analytics_time", "scheduler_enabled", "timezone"}
+
+
+@app.get("/api/scheduler/status")
+def api_scheduler_status():
+    s = get_settings()
+    return {"qstash_configured": qstash_client.configured(), "can_verify": qstash_client.can_verify(),
+            "times": workflow.schedule_times(s), "timezone": s.get("timezone") or "Asia/Kolkata", "next_runs": sched_jobs.next_runs(),
+            "wanted": {k: {"path": v[0], "cron": v[1]} for k, v in qstash_schedules.desired(s).items()},
+            "last_sync_at": s.get("qstash_sync_at", ""), "last_sync_error": s.get("qstash_sync_error", ""),
+            "due_post": workflow.due_post()}
+
+
+# ------------------------------------------------------------------ Automation overview (Phase 6): every value from the DB
+SYSTEM_JOBS = {"research": ["research"], "generate": ["generate", "pipeline"], "publishing": ["publish", "publish_due"], "analytics": ["analytics"]}
+SYSTEM_NEXT = {"research": "research", "generate": "generate", "publishing": "publish", "analytics": "analytics"}
+RUNNABLE = {"research", "generate", "publish_due", "analytics", "maintenance"}
+
+
+def _job_system(kinds, next_at, enabled):
+    marks = ",".join("?" * len(kinds))
+    since = (now_ist() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    last = one(f"SELECT id, kind, trigger, status, stage, progress, started_at, finished_at, error FROM jobs WHERE kind IN ({marks}) ORDER BY id DESC LIMIT 1", kinds)
+    counts = {r["status"]: r["n"] for r in query(f"SELECT status, COUNT(*) n FROM jobs WHERE kind IN ({marks}) AND started_at >= ? GROUP BY status", (*kinds, since))}
+    err = one(f"SELECT id, error, finished_at FROM jobs WHERE kind IN ({marks}) AND status='FAILED' ORDER BY id DESC LIMIT 1", kinds)
+    running = one(f"SELECT id, stage, progress FROM jobs WHERE kind IN ({marks}) AND status='RUNNING' ORDER BY id DESC LIMIT 1", kinds)
+    status = "RUNNING" if running else ("NEVER" if not last else ("FAILED" if last["status"] == "FAILED" else "OK"))
+    return {"status": status, "last": last, "running": running, "success_7d": counts.get("SUCCESS", 0), "failed_7d": counts.get("FAILED", 0),
+            "latest_error": err, "next_at": next_at if enabled else None}
+
+
+@app.get("/api/automation/overview")
+def api_automation_overview():
+    s = get_settings()
+    enabled = s.get("scheduler_enabled", "1") == "1"
+    nxt = sched_jobs.next_runs()
+    systems = {k: _job_system(v, nxt.get(SYSTEM_NEXT[k]), enabled) for k, v in SYSTEM_JOBS.items()}
+    systems["publishing"]["posts"] = {
+        "failed": one("SELECT COUNT(*) n FROM carousels WHERE status='PUBLISH_FAILED'")["n"],
+        "in_progress": one("SELECT COUNT(*) n FROM carousels WHERE status='PUBLISHING'")["n"],
+        "scheduled": one("SELECT COUNT(*) n FROM carousels WHERE status='PENDING_APPROVAL' AND approved_at!='' AND approved_at IS NOT NULL AND scheduled_for!=''")["n"],
+        "next_scheduled": one("SELECT id, scheduled_for FROM carousels WHERE status='PENDING_APPROVAL' AND approved_at!='' AND approved_at IS NOT NULL AND scheduled_for!='' ORDER BY scheduled_for LIMIT 1"),
+    }
+    since_utc = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev = {r["status"]: r["n"] for r in query("SELECT status, COUNT(*) n FROM webhook_events WHERE kind='comment' AND received_at >= ? GROUP BY status", (since_utc,))}
+    ev_err = one("SELECT id, error, received_at FROM webhook_events WHERE status='FAILED' ORDER BY id DESC LIMIT 1")
+    last_ev = one("SELECT received_at FROM webhook_events WHERE kind='comment' ORDER BY id DESC LIMIT 1")
+    systems["comments"] = {"status": "FAILED" if ev.get("FAILED") else ("OK" if last_ev else "NEVER"),
+                           "last_received_at": (last_ev or {}).get("received_at"), "counts_7d": ev,
+                           "success_7d": ev.get("PROCESSED", 0) + ev.get("IGNORED", 0), "failed_7d": ev.get("FAILED", 0), "latest_error": ev_err,
+                           "pending": ev.get("PENDING", 0) + ev.get("QUEUED", 0)}
+    dm = {r["status"]: r["n"] for r in query("SELECT status, COUNT(*) n FROM dm_deliveries GROUP BY status")}
+    dm_err = one("SELECT id, campaign_id, error, updated_at FROM dm_deliveries WHERE status IN ('FAILED','UNCERTAIN') ORDER BY id DESC LIMIT 1")
+    last_dm = one("SELECT sent_at FROM dm_deliveries WHERE sent_at!='' AND sent_at IS NOT NULL ORDER BY sent_at DESC LIMIT 1")
+    systems["dm"] = {"status": "FAILED" if dm_err and dm.get("FAILED", 0) + dm.get("UNCERTAIN", 0) else ("OK" if last_dm else "NEVER"),
+                     "last_sent_at": (last_dm or {}).get("sent_at"), "counts": dm,
+                     "success_7d": one("SELECT COUNT(*) n FROM dm_deliveries WHERE sent_at >= ?", (since_utc,))["n"],
+                     "failed_7d": dm.get("FAILED", 0) + dm.get("UNCERTAIN", 0), "latest_error": dm_err}
+    wh_counts = {r["status"]: r["n"] for r in query("SELECT status, COUNT(*) n FROM webhook_events GROUP BY status")}
+    audit = s.get("meta_audit_json", "")
+    try:
+        audit = json.loads(audit) if audit else None
+    except ValueError:
+        audit = None
+    health = {
+        "verified_at": s.get("webhook_verified_at", ""), "app_secret_configured": bool(_meta_app_secret()),
+        "callback_url": f"{media._base()}/api/webhooks/instagram" if ON_VERCEL else "", "last_received_at": s.get("webhook_last_received_at", ""),
+        "last_processed_at": (one("SELECT processed_at FROM webhook_events WHERE processed_at!='' ORDER BY processed_at DESC LIMIT 1") or {}).get("processed_at", ""),
+        "last_dm_at": (last_dm or {}).get("sent_at", ""), "failed_dm_count": dm.get("FAILED", 0) + dm.get("UNCERTAIN", 0),
+        "events": wh_counts,
+        "qstash": {"configured": qstash_client.configured(), "can_verify": qstash_client.can_verify(), "last_sync_at": s.get("qstash_sync_at", ""),
+                   "sync_error": s.get("qstash_sync_error", ""), "schedules": len(json.loads(s.get("qstash_schedules") or "[]"))},
+        "subscription": {"checked_at": s.get("meta_audit_at", ""), "comments": (audit or {}).get("webhook_fields", {}).get("comments"),
+                         "messages": (audit or {}).get("webhook_fields", {}).get("messages"), "page_subscribed": (audit or {}).get("page_subscribed")} if audit
+                        else {"checked_at": "", "note": "Not checked yet: run the Meta configuration check"},
+    }
+    return {"enabled": enabled, "mode": s.get("publishing_mode", "REVIEW"), "times": workflow.schedule_times(s), "systems": systems, "webhook": health}
+
+
+@app.post("/api/meta/audit")
+def api_meta_audit():
+    """Read-only Meta configuration check (GET requests only). Result is stored for the Webhook health panel; no tokens in it."""
+    import meta_audit
+    meta.reload()
+    res = meta_audit.run()
+    set_setting("meta_audit_json", json.dumps(res)[:20000])
+    set_setting("meta_audit_at", res["checked_at"])
+    return res
+
+
+@app.get("/api/meta/audit")
+def api_meta_audit_last():
+    raw = get_settings().get("meta_audit_json", "")
+    return json.loads(raw) if raw else {"checked_at": "", "note": "Not checked yet"}
+
+
+@app.post("/api/automation/run/{kind}")
+async def api_automation_run(kind: str, req: Request):
+    """Dashboard 'Run now'. Uses the same DB lease as scheduled runs, so it never overlaps one. Publishing needs confirm."""
+    if kind not in RUNNABLE:
+        raise HTTPException(404, "Unknown job")
+    if kind == "publish_due" and not (await body(req)).get("confirm"):
+        raise ValueError("Publishing due posts needs explicit confirmation")
+    fn = sched_jobs.JOBS[kind]["fn"]
+
+    def locked(ctx):
+        holder = sched_jobs.acquire(kind)
+        if not holder:
+            return {"success": False, "error": f"A {kind} run is already in progress (scheduled or manual)"}
+        try:
+            return fn(ctx)
+        finally:
+            sched_jobs.release(kind, holder)
+    return start_job(kind, locked, trigger="manual")
+
+
+@app.post("/api/scheduler/sync")
+def api_scheduler_sync():
+    return qstash_schedules.sync()
+
+
+@app.post("/api/queue/job/{kind}")
+async def api_queue_job(kind: str, request: Request):
+    """QStash schedule callback. Signature must be valid for this exact URL; slot + lease make redelivery harmless."""
+    raw = await request.body()
+    ok, why = qstash_client.verify(request.headers.get("upstash-signature", ""), raw, qstash_client.destination(f"/api/queue/job/{kind}"))
+    if not ok:
+        return JSONResponse(status_code=401, content={"error": why})
+    if kind == "tick":  # maintenance + any post scheduled for a custom time
+        c1, r1 = sched_jobs.run("maintenance", trigger="qstash")
+        c2, r2 = sched_jobs.run("publish_due", trigger="qstash") if workflow.due_post() else (200, {"skipped": "nothing due"})
+        return JSONResponse(status_code=max(c1, c2), content={"maintenance": r1, "publish_due": r2})
+    code, res = sched_jobs.run(kind, trigger="qstash")
+    return JSONResponse(status_code=code, content=res)
+
+
+@app.post("/api/carousels/{cid}/schedule")
+async def api_schedule_post(cid: int, req: Request):
+    """Approve + schedule. `at` is local dashboard time (Asia/Kolkata) 'YYYY-MM-DDTHH:MM'; stored as UTC."""
+    b = await body(req)
+    if not b.get("confirm"):
+        raise ValueError("Scheduling a post approves it for publishing; confirm is required")
+    try:
+        when = workflow.ist_to_utc(str(b.get("at", "")))
+    except ValueError:
+        raise ValueError("Pick a date and time")
+    now = datetime.now(timezone.utc)
+    when_dt = datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    if when_dt < now - timedelta(minutes=1) or when_dt > now + timedelta(days=60):
+        raise ValueError("Choose a time between now and 60 days ahead")
+    return workflow.schedule_post(cid, when)
+
+
+@app.delete("/api/carousels/{cid}/schedule")
+def api_unschedule_post(cid: int):
+    return workflow.unschedule_post(cid)
 
 
 @app.get("/api/system")
@@ -580,7 +758,7 @@ def api_meta_insights():
 
 # ------------------------------------------------------------------ campaigns
 CAMPAIGN_FIELDS = ["name", "keyword", "media_id", "carousel_id", "private_reply", "follow_gate", "follow_gate_message",
-                   "resource_pack", "public_reply_enabled", "public_reply_text", "active"]
+                   "resource_pack", "public_reply_enabled", "public_reply_text", "active", "keywords", "guide_url"]
 
 
 def _campaign_clean(b: Dict[str, Any]) -> Dict[str, Any]:
@@ -589,6 +767,16 @@ def _campaign_clean(b: Dict[str, Any]) -> Dict[str, Any]:
         c["keyword"] = re.sub(r"[^A-Za-z0-9_]", "", str(c["keyword"])).upper()
         if not 2 <= len(c["keyword"]) <= 20:
             raise ValueError("Keyword must be 2–20 letters/digits")
+    if "keywords" in c:  # extra trigger words; matching is case-insensitive, whole word
+        extra = [re.sub(r"[^A-Za-z0-9_]", "", w).upper() for w in re.split(r"[,\s]+", str(c["keywords"] or ""))]
+        extra = list(dict.fromkeys(w for w in extra if w))
+        if len(extra) > 10 or any(not 2 <= len(w) <= 20 for w in extra):
+            raise ValueError("Up to 10 extra keywords, each 2–20 letters/digits")
+        c["keywords"] = ",".join(extra)
+    if "guide_url" in c:
+        c["guide_url"] = str(c["guide_url"] or "").strip()
+        if c["guide_url"] and not re.match(r"^https://\S{4,500}$", c["guide_url"]):
+            raise ValueError("Guide link must be a full https:// URL")
     if "name" in c and not str(c["name"]).strip():
         raise ValueError("Campaign name is required")
     if c.get("media_id") and not re.match(r"^\d{5,30}$", str(c["media_id"])):
@@ -650,6 +838,18 @@ def api_deliveries(cid: int):
     return query("SELECT * FROM dm_deliveries WHERE campaign_id=? ORDER BY id DESC LIMIT 200", (cid,))
 
 
+@app.get("/api/deliveries/{did}/log")
+def api_delivery_log(did: int):
+    return query("SELECT * FROM dm_delivery_log WHERE delivery_id=? ORDER BY id", (did,))
+
+
+@app.post("/api/deliveries/{did}/retry")
+async def api_delivery_retry(did: int, req: Request):
+    """Safe retry: FAILED only. UNCERTAIN (Meta may have sent it) needs confirm_uncertain=true because it can double-message."""
+    from automation import dm_engine
+    return dm_engine.retry_delivery(did, force_uncertain=bool((await body(req)).get("confirm_uncertain")))
+
+
 @app.post("/api/campaigns/{cid}/scan")
 async def api_scan(cid: int, req: Request):
     b = await body(req)
@@ -677,10 +877,15 @@ def _cron_ok(req: Request) -> bool:
 def api_cron(kind: str, request: Request):
     if not _cron_ok(request):
         return JSONResponse(status_code=401, content={"error": "Set CRON_SECRET in Vercel; cron requests must carry it"})
+    if kind == "tick":  # called every few minutes; runs research/pipeline at the times set on the Automation page
+        return {"started": daily_runner.tick()}
     if kind == "research":
         return start_job("research", workflow.run_research, trigger="cron", background=False)
     if kind == "pipeline":
         return start_job("pipeline", workflow.run_pipeline, trigger="cron", background=False)
+    if kind == "maintenance":  # daily Vercel safety net (vercel.json): recovery only, never content
+        code, res = sched_jobs.run("maintenance", trigger="cron")
+        return JSONResponse(status_code=code, content=res)
     if kind == "dm":  # optional: call every few minutes from an external cron as a backup to webhooks
         set_setting("dm_last_poll", "")
         return daily_runner.poll_dms()
@@ -700,53 +905,70 @@ def webhook_token() -> str:
 def api_webhook_verify(request: Request):
     q = request.query_params
     if q.get("hub.mode") == "subscribe" and hmac.compare_digest(q.get("hub.verify_token", ""), webhook_token()):
+        set_setting("webhook_verified_at", webhook_inbox.utc_now())  # Meta (or you) completed the subscription handshake
         return HTMLResponse(q.get("hub.challenge", ""))
     return JSONResponse(status_code=403, content={"error": "verify token mismatch"})
 
 
-_wh_last: Dict[int, float] = {}
+def _meta_app_secret() -> str:
+    return os.getenv("META_APP_SECRET", "") or meta.app_secret or ""
 
 
 @app.post("/api/webhooks/instagram")
 async def api_webhook(request: Request):
-    """Events only wake the app up; every action re-reads comments/messages from the Graph API itself,
-    so a forged event can't make it message anyone who didn't really comment."""
+    """Verify → store → enqueue → 200. No Graph API calls here: Meta needs a fast answer, and the work runs from the queue."""
     raw = await request.body()
-    secret = meta.app_secret
-    if secret:
-        sig = request.headers.get("x-hub-signature-256", "")
-        good = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, good):
-            return JSONResponse(status_code=403, content={"error": "bad signature"})
+    secret = _meta_app_secret()
+    if not secret:  # without the app secret nobody can tell Meta's events from forged ones
+        log_event("webhook", "Rejected a webhook: META_APP_SECRET is not configured")
+        return JSONResponse(status_code=503, content={"error": "META_APP_SECRET not configured"})
+    sig = request.headers.get("x-hub-signature-256", "")
+    good = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not sig or not hmac.compare_digest(sig, good):
+        return JSONResponse(status_code=403, content={"error": "missing or invalid X-Hub-Signature-256"})
     try:
         data = json.loads(raw or b"{}")
-    except Exception:
-        return {"ok": True}
-    media_ids, senders = set(), set()
-    for e in data.get("entry", []):
-        for ch in e.get("changes", []):
-            if ch.get("field") in ("comments", "live_comments"):
-                media_ids.add(str(((ch.get("value") or {}).get("media") or {}).get("id", "")))
-        for m in e.get("messaging", []):
-            senders.add(str((m.get("sender") or {}).get("id", "")))
-    camps = query("SELECT * FROM campaigns WHERE active=1 AND media_id!=''")
-    todo = [c for c in camps if c["media_id"] in media_ids]
-    if senders:
-        ids = {r["campaign_id"] for r in query("SELECT campaign_id, igsid FROM dm_deliveries WHERE status IN ('AWAITING_TAP','AWAITING_FOLLOW')") if r["igsid"] in senders}
-        todo += [c for c in camps if c["id"] in ids and c not in todo]
-    responder.reload()
-    for c in todo:
-        if time.time() - _wh_last.get(c["id"], 0) < 3:
-            continue
-        _wh_last[c["id"]] = time.time()
-        try:
-            rep = responder.scan_campaign(c, dry_run=False, log=lambda *a: None)
-            n = len(rep.get("matches", [])) + sum(1 for f in rep.get("followups", []) if f.get("status"))
-            if n:
-                log_event("dm", f"Webhook: “{c['keyword']}” handled {n} action(s)", c["id"])
-        except Exception as e:
-            log_event("dm", f"Webhook scan failed for #{c['id']}: {e}", c["id"])
-    return {"ok": True}
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    set_setting("webhook_last_received_at", webhook_inbox.utc_now())
+    new_ids = webhook_inbox.store(webhook_inbox.parse(data))
+    out = webhook_inbox.dispatch(new_ids)
+    return {"ok": True, "stored": len(new_ids), **out}
+
+
+@app.post("/api/queue/webhook-event")
+async def api_queue_webhook_event(request: Request):
+    """QStash callback. Only QStash-signed requests for this exact URL are accepted; processing is idempotent."""
+    raw = await request.body()
+    ok, why = qstash_client.verify(request.headers.get("upstash-signature", ""), raw, qstash_client.destination(webhook_inbox.PROCESS_PATH))
+    if not ok:
+        return JSONResponse(status_code=401, content={"error": why})
+    try:
+        event_id = int(json.loads(raw or b"{}").get("event_id"))
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse(status_code=400, content={"error": "event_id required"})
+    code, res = webhook_inbox.process_event(event_id)
+    return JSONResponse(status_code=code, content=res)
+
+
+@app.get("/api/inbox/events")
+def api_inbox_events(limit: int = 50, status: str = ""):
+    rows = query(f"SELECT id, event_key, kind, media_id, sender_username, text, status, attempts, received_at, queued_at, processed_at, error, result_json "
+                 f"FROM webhook_events {'WHERE status=?' if status else ''} ORDER BY id DESC LIMIT ?",
+                 ((status, min(limit, 200)) if status else (min(limit, 200),)))
+    counts = {r["status"]: r["n"] for r in query("SELECT status, COUNT(*) n FROM webhook_events GROUP BY status")}
+    return {"events": rows, "counts": counts, "qstash": {"configured": qstash_client.configured(), "can_verify": qstash_client.can_verify()},
+            "app_secret_configured": bool(_meta_app_secret()), "last_received_at": get_settings().get("webhook_last_received_at", "")}
+
+
+@app.post("/api/inbox/sweep")
+def api_inbox_sweep():
+    return webhook_inbox.sweep()
+
+
+@app.post("/api/inbox/events/{event_id}/retry")
+def api_inbox_retry(event_id: int):
+    return webhook_inbox.retry_failed(event_id)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,51 @@ CREATE TABLE IF NOT EXISTS dm_deliveries (
   id SERIAL PRIMARY KEY, campaign_id INTEGER, comment_id TEXT UNIQUE, username TEXT DEFAULT '', igsid TEXT DEFAULT '',
   comment_text TEXT DEFAULT '', status TEXT DEFAULT 'MATCHED', follower_status TEXT DEFAULT 'UNKNOWN', error TEXT DEFAULT '',
   created_at TEXT, updated_at TEXT DEFAULT '', user_msgs INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0);
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS ig_container_id TEXT DEFAULT '';
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS ig_children_json TEXT DEFAULT '[]';
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS publish_stage TEXT DEFAULT '';
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS publish_attempt_at TEXT DEFAULT '';
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS publish_error_json TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS webhook_events (
+  id SERIAL PRIMARY KEY, event_key TEXT UNIQUE NOT NULL, comment_id TEXT UNIQUE, kind TEXT NOT NULL, field TEXT DEFAULT '',
+  ig_account_id TEXT DEFAULT '', media_id TEXT DEFAULT '', sender_id TEXT DEFAULT '', sender_username TEXT DEFAULT '',
+  text TEXT DEFAULT '', event_time TEXT DEFAULT '', raw_json TEXT DEFAULT '', status TEXT DEFAULT 'PENDING', attempts INTEGER DEFAULT 0,
+  received_at TEXT, queued_at TEXT DEFAULT '', qstash_message_id TEXT DEFAULT '', processing_started_at TEXT DEFAULT '',
+  processed_at TEXT DEFAULT '', result_json TEXT DEFAULT '', error TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS webhook_events_status ON webhook_events (status, received_at);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS keywords TEXT DEFAULT '';
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS guide_url TEXT DEFAULT '';
+ALTER TABLE dm_deliveries ADD COLUMN IF NOT EXISTS event_id INTEGER;
+ALTER TABLE dm_deliveries ADD COLUMN IF NOT EXISTS sent_at TEXT DEFAULT '';
+ALTER TABLE dm_deliveries ADD COLUMN IF NOT EXISTS retryable INTEGER DEFAULT 0;
+ALTER TABLE dm_deliveries ADD COLUMN IF NOT EXISTS last_error_json TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS dm_delivery_log (
+  id SERIAL PRIMARY KEY, delivery_id INTEGER, campaign_id INTEGER, at TEXT, step TEXT, ok INTEGER, detail TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS dm_delivery_log_delivery ON dm_delivery_log (delivery_id);
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS slot_key TEXT DEFAULT '';
+ALTER TABLE carousels ADD COLUMN IF NOT EXISTS approved_at TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS job_locks (id SERIAL PRIMARY KEY, kind TEXT UNIQUE NOT NULL, holder TEXT DEFAULT '', lease_until TEXT DEFAULT '');
 """
+# v5 (Phase 5) scheduler: jobs.slot_key (one success per daily slot), job_locks (cross-instance lease), carousels.approved_at (UTC).
+# carousels.scheduled_for (previously unused) now holds a UTC ISO time; publish_due only acts on rows that ALSO have approved_at.
+JOB_COLS = [("slot_key", "TEXT DEFAULT ''")]
+SCHEDULE_COLS = [("approved_at", "TEXT DEFAULT ''")]
+JOB_LOCKS_SQLITE = "CREATE TABLE IF NOT EXISTS job_locks (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT UNIQUE NOT NULL, holder TEXT DEFAULT '', lease_until TEXT DEFAULT '')"
+# v5 (Phase 4) comment-to-DM engine: extra keywords + guide link per campaign, delivery state, history. New timestamps UTC.
+CAMPAIGN_COLS = [("keywords", "TEXT DEFAULT ''"), ("guide_url", "TEXT DEFAULT ''")]
+DELIVERY_COLS = [("event_id", "INTEGER"), ("sent_at", "TEXT DEFAULT ''"), ("retryable", "INTEGER DEFAULT 0"), ("last_error_json", "TEXT DEFAULT ''")]
+DM_LOG_SQLITE = """CREATE TABLE IF NOT EXISTS dm_delivery_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id INTEGER, campaign_id INTEGER, at TEXT, step TEXT, ok INTEGER, detail TEXT DEFAULT '')"""
+# v5 (Phase 3) durable webhook inbox. All its timestamps are UTC ISO-8601.
+WEBHOOK_EVENTS_SQLITE = """CREATE TABLE IF NOT EXISTS webhook_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL, comment_id TEXT UNIQUE, kind TEXT NOT NULL, field TEXT DEFAULT '',
+  ig_account_id TEXT DEFAULT '', media_id TEXT DEFAULT '', sender_id TEXT DEFAULT '', sender_username TEXT DEFAULT '',
+  text TEXT DEFAULT '', event_time TEXT DEFAULT '', raw_json TEXT DEFAULT '', status TEXT DEFAULT 'PENDING', attempts INTEGER DEFAULT 0,
+  received_at TEXT, queued_at TEXT DEFAULT '', qstash_message_id TEXT DEFAULT '', processing_started_at TEXT DEFAULT '',
+  processed_at TEXT DEFAULT '', result_json TEXT DEFAULT '', error TEXT DEFAULT '')"""
+# v5 (Phase 2) publish tracking — additive only. publish_attempt_at is UTC ISO-8601 ("...Z"); older columns stay IST.
+PUBLISH_COLS = [("ig_container_id", "TEXT DEFAULT ''"), ("ig_children_json", "TEXT DEFAULT '[]'"), ("publish_stage", "TEXT DEFAULT ''"),
+                ("publish_attempt_at", "TEXT DEFAULT ''"), ("publish_error_json", "TEXT DEFAULT ''")]
 
 
 def migrate_pg():
@@ -74,6 +118,8 @@ DEFAULTS = {
     "publishing_mode": "REVIEW",
     "target_publish_time": "19:00",
     "research_time": "17:30",
+    "generate_time": "",       # "" = automatic: 45 minutes before the publishing time
+    "analytics_time": "23:30",
     "timezone": "Asia/Kolkata",
     "min_qc_score": "85",
     "max_posts_per_day": "1",
@@ -183,6 +229,16 @@ def migrate(db_path=None):
     _add_cols(c, "carousels", [("rendered_json", "TEXT DEFAULT '[]'"), ("guide_json", "TEXT DEFAULT '[]'")])
     c.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     _add_cols(c, "dm_deliveries", [("user_msgs", "INTEGER DEFAULT 0"), ("attempts", "INTEGER DEFAULT 0")])
+    _add_cols(c, "carousels", PUBLISH_COLS)
+    c.execute(WEBHOOK_EVENTS_SQLITE)
+    c.execute("CREATE INDEX IF NOT EXISTS webhook_events_status ON webhook_events (status, received_at)")
+    _add_cols(c, "campaigns", CAMPAIGN_COLS)
+    _add_cols(c, "dm_deliveries", DELIVERY_COLS)
+    c.execute(DM_LOG_SQLITE)
+    c.execute("CREATE INDEX IF NOT EXISTS dm_delivery_log_delivery ON dm_delivery_log (delivery_id)")
+    _add_cols(c, "jobs", JOB_COLS)
+    _add_cols(c, "carousels", SCHEDULE_COLS)
+    c.execute(JOB_LOCKS_SQLITE)
     if not c.execute("SELECT 1 FROM settings WHERE key='theme_v4'").fetchone():
         c.execute("UPDATE settings SET value='studio' WHERE key='default_theme'")
         c.execute("INSERT INTO settings (key, value) VALUES ('theme_v4', '1')")

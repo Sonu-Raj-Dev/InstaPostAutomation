@@ -127,8 +127,13 @@ def test_publish_success_records_meta_ids(monkeypatch):
     cid = queued_post()
     monkeypatch.setattr(workflow.meta, "_get", lambda *a, **k: {"ok": True, "data": {"username": "tester"}})
     monkeypatch.setattr(workflow.media, "public_url", lambda p: "https://cdn.example/x.jpg")
-    monkeypatch.setattr(workflow.meta, "publish_carousel", lambda urls, cap: {"success": True, "post_id": "1790001"})
-    monkeypatch.setattr(workflow.meta, "publish_single_image", lambda url, cap: {"success": True, "post_id": "1790001"})
+    # Phase 2: publish() drives the Meta steps itself (container → status → publish) instead of publish_carousel()
+    monkeypatch.setattr(workflow, "check_image_url", lambda u: (True, ""))
+    monkeypatch.setattr(workflow.meta, "token_scopes", lambda: None)
+    monkeypatch.setattr(workflow.meta, "create_container", lambda *a, **k: {"ok": True, "data": {"id": "c1"}})
+    monkeypatch.setattr(workflow.meta, "create_carousel_container", lambda *a, **k: {"ok": True, "data": {"id": "p1"}})
+    monkeypatch.setattr(workflow.meta, "wait_container", lambda cid: {"ok": True, "status_code": "FINISHED"})
+    monkeypatch.setattr(workflow.meta, "publish_creation", lambda cid: {"ok": True, "data": {"id": "1790001"}})
     monkeypatch.setattr(workflow.meta, "get_permalink", lambda mid: "https://www.instagram.com/p/ABC123/")
     assert workflow.publish(cid)["success"]
     c = one("SELECT * FROM carousels WHERE id=?", (cid,))
@@ -233,18 +238,22 @@ def test_live_scan_requires_active_and_confirm():
 
 # ---------------------------------------------------------------- scheduler
 def test_scheduler_fires_once_inside_window(monkeypatch):
-    started = []
-    monkeypatch.setattr(daily_runner, "start_job", lambda kind, fn, trigger: started.append(kind) or {"started": True})
+    # Phase 5: the tick runs independent jobs (research / generate / publish_due / analytics); stubbed here
+    from scheduler import jobs
+    ran = []
+    for k in jobs.JOBS:
+        monkeypatch.setitem(jobs.JOBS[k], "fn", (lambda kk: lambda ctx: ran.append(kk) or {"success": True})(k))
     set_setting("research_time", "17:30"); set_setting("target_publish_time", "19:00"); set_setting("scheduler_enabled", "1")
-    for k in ("last_research_slot", "last_pipeline_slot"):
-        execute("DELETE FROM settings WHERE key=?", (k,))
-    day = datetime(2026, 11, 21, tzinfo=IST)
+    set_setting("generate_time", ""); set_setting("analytics_time", "23:30")
+    day = datetime(2030, 1, 7, tzinfo=IST)  # a day no other test uses, so slot history starts empty
     assert daily_runner.tick(day.replace(hour=17, minute=10)) == []           # too early
     assert daily_runner.tick(day.replace(hour=17, minute=31)) == ["research"]  # fires
     assert daily_runner.tick(day.replace(hour=17, minute=40)) == []           # once per day
-    assert daily_runner.tick(day.replace(hour=20, minute=0)) == []            # pipeline window (19:00–19:30) missed
+    assert daily_runner.tick(day.replace(hour=20, minute=0)) == []            # generate window (18:15–18:45) missed
     set_setting("scheduler_enabled", "0")
-    assert daily_runner.tick(day.replace(hour=19, minute=5)) == []
+    assert daily_runner.tick(day.replace(hour=18, minute=20)) == []
+    set_setting("scheduler_enabled", "1")
+    assert ran == ["research"]
 
 
 # ---------------------------------------------------------------- real render (headless browser)
@@ -274,6 +283,9 @@ def test_cron_needs_secret(monkeypatch):
     assert client.get("/api/cron/research").status_code == 401
     monkeypatch.setenv("CRON_SECRET", "abc")
     assert client.get("/api/cron/research", headers={"authorization": "Bearer wrong"}).status_code == 401
+    monkeypatch.setattr(webapp.daily_runner, "tick", lambda: ["research"])
+    r = client.get("/api/cron/tick", headers={"authorization": "Bearer abc"})
+    assert r.status_code == 200 and r.json() == {"started": ["research"]}
 
 
 def test_webhook_verify_and_wake(monkeypatch):
@@ -281,13 +293,23 @@ def test_webhook_verify_and_wake(monkeypatch):
     ok = client.get("/api/webhooks/instagram", params={"hub.mode": "subscribe", "hub.verify_token": tok, "hub.challenge": "42"})
     assert ok.status_code == 200 and ok.text == "42"
     assert client.get("/api/webhooks/instagram", params={"hub.mode": "subscribe", "hub.verify_token": "x", "hub.challenge": "42"}).status_code == 403
+    # Phase 3: signed events go through the durable inbox; the campaign scan runs from the processor, not the webhook request
+    import hashlib, hmac as _hmac
+    from automation import webhook_inbox
     seen = []
-    monkeypatch.setattr(webapp.responder, "scan_campaign", lambda camp, dry_run, log: seen.append((camp["media_id"], dry_run)) or {"matches": [], "followups": []})
-    monkeypatch.setattr(webapp.responder, "reload", lambda: None)
-    monkeypatch.setattr(webapp.meta, "app_secret", "")
+    # Phase 4: per-comment engine — the comment is re-read from Instagram, then exactly one private reply is sent
+    monkeypatch.setattr(CommentResponder, "get_comment", lambda self, cid: (True, {"id": cid, "text": "hook", "from": {"id": "u-wake", "username": "waker"}, "media": {"id": "1790999"}}, {}))
+    monkeypatch.setattr(CommentResponder, "send_private_reply", lambda self, cid, text: seen.append(("1790999", False)) or (True, ""))
+    monkeypatch.setattr(CommentResponder, "reload", lambda self: None)
+    monkeypatch.setenv("META_APP_SECRET", "wake-secret")
+    monkeypatch.delenv("QSTASH_TOKEN", raising=False)
+
+    monkeypatch.setattr(webhook_inbox, "_background", lambda fn, *a: fn(*a))  # run the local worker inline
     client.post("/api/campaigns", json={"name": "WH", "keyword": "HOOK", "media_id": "1790999", "resource_pack": "x", "active": True})
-    client.post("/api/webhooks/instagram", json={"object": "instagram", "entry": [{"changes": [{"field": "comments", "value": {"media": {"id": "1790999"}}}]}]})
-    assert ("1790999", False) in seen
+    body = json.dumps({"object": "instagram", "entry": [{"changes": [{"field": "comments", "value": {"id": "wake1", "text": "hook", "media": {"id": "1790999"}}}]}]}).encode()
+    sig = "sha256=" + _hmac.new(b"wake-secret", body, hashlib.sha256).hexdigest()
+    assert client.post("/api/webhooks/instagram", content=body, headers={"x-hub-signature-256": sig}).status_code == 200
+    assert ("1790999", False) in seen and one("SELECT status FROM dm_deliveries WHERE comment_id='wake1'")["status"] == "AWAITING_TAP"
 
 
 def test_postgres_dialect_translation():

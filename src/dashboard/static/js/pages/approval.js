@@ -47,7 +47,8 @@ export default {
 
         ${c.legacy ? html`<div class="notice warn">${icon("history")}<div><b>Created by the previous version.</b> This entry has no per-post slides or verified slide content, so it can't be published from here. Rebuild it from its topic in the Studio, or reject it to clear the queue.</div></div>` : ""}
         ${c.status === "PUBLISHED" ? html`<div class="notice info">${icon("check-circle-2")}<div><b>Published — confirmed by Meta.</b> ${c.ig_media_id || c.metricool_post_id ? html`Media id <span class="mono">${c.ig_media_id || c.metricool_post_id}</span>. ` : ""}${c.permalink && !c.permalink.includes("/p/1") ? html`<a href="${c.permalink}" target="_blank" rel="noopener">Open on Instagram</a>` : html`<span class="dim">No permalink stored.</span>`}</div></div>` : ""}
-        ${c.status === "PUBLISH_FAILED" ? html`<div class="notice err">${icon("alert-triangle")}<div><b>Last publish attempt failed.</b><br>${c.error_message}</div></div>` : ""}
+        ${c.status === "PUBLISH_FAILED" ? html`<div class="notice err">${icon("alert-triangle")}<div><b>Last publish attempt failed${c.publish_stage ? html` during ${c.publish_stage.toLowerCase()}` : ""}.</b><br><span style="overflow-wrap:anywhere">${c.error_message}</span></div></div>` : ""}
+        ${c.status === "PUBLISHING" && !(job && job.ref_id === c.id) ? html`<div class="notice warn">${icon("help-circle")}<div><b>Publish not confirmed yet${c.publish_stage ? html` (stopped at ${c.publish_stage.toLowerCase()})` : ""}.</b> ${c.error_message || "The publish request ended without a final answer."} Check status asks Meta whether it went live. It never publishes again.<div style="margin-top:8px"><button class="btn sm" id="recon">${icon("refresh-ccw")}Check status</button></div></div></div>` : ""}
         ${c.status === "REJECTED" && c.reject_reason ? html`<div class="notice">${icon("x-circle")}<div><b>Rejected:</b> ${c.reject_reason}</div></div>` : ""}
         ${job && job.ref_id === c.id || c.status === "PUBLISHING" ? html`<div class="job"><div class="spread"><span class="chip live"><span class="dot"></span>Publishing</span><span class="mono dim">${job ? job.progress : 0}%</span></div><div>${job ? job.stage : "Waiting for Meta…"}</div><div class="progress"><i style="width:${job ? job.progress : 5}%"></i></div></div>` : ""}
 
@@ -73,9 +74,11 @@ export default {
         ${c.legacy ? "" : html`<details><summary class="label" style="cursor:pointer">Quality checks (${c.qc.checks ? c.qc.checks.filter((k) => k.pass).length : 0}/${c.qc.checks ? c.qc.checks.length : 0} passed)</summary>
           <div class="checks" style="margin-top:10px">${(c.qc.checks || []).map((k) => html`<div class="check ${k.pass ? "pass" : "fail"}">${icon(k.pass ? "check-circle-2" : "alert-circle")}<div>${k.name}<small>${k.detail}</small></div><span class="pts">${k.points}/${k.max}</span></div>`)}</div></details>`}
 
+        ${c.approved_at && c.scheduled_for && c.status === "PENDING_APPROVAL" ? html`<div class="notice info">${icon("calendar-clock")}<div><b>Approved and scheduled for ${new Date(c.scheduled_for).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })} IST.</b> It publishes automatically at that time. <button class="btn sm ghost" id="unsched">${icon("calendar-x")}Clear schedule</button></div></div>` : ""}
+        ${canPublish && !blockers.length ? html`<div class="row" style="gap:8px;align-items:end"><label class="field" style="margin:0"><span>Publish at (IST)</span><input class="input" type="datetime-local" id="schedAt"></label><button class="btn" id="sched">${icon("calendar-plus")}Approve & schedule</button></div>` : ""}
         ${blockers.length ? html`<div class="notice warn">${icon("lock")}<div><b>Publishing is blocked:</b><ul style="margin:6px 0 0;padding-left:18px">${blockers.map((b) => html`<li>${b}</li>`)}</ul></div></div>` : ""}
         <div class="row">
-          ${canPublish ? html`<button class="btn publish" id="pub" ${blockers.length || job ? "disabled" : ""}>${icon("send")}Approve & publish${m.username ? ` to @${m.username}` : ""}</button>` : ""}
+          ${canPublish ? html`<button class="btn publish" id="pub" ${blockers.length || job ? "disabled" : ""}>${icon("send")}${c.status === "PUBLISH_FAILED" ? "Retry publish" : "Approve & publish"}${m.username ? ` to @${m.username}` : ""}</button>` : ""}
           ${!c.legacy && !["PUBLISHED", "PUBLISHING"].includes(c.status) ? html`<a class="btn" href="#creator?id=${c.id}">${icon("pen-tool")}Edit slides</a><button class="btn" id="regen">${icon("refresh-ccw")}Regenerate</button>` : ""}
           ${c.legacy && c.topic_id ? html`<button class="btn primary" id="rebuild">${icon("sparkles")}Rebuild in Studio</button>` : ""}
           ${!["PUBLISHED", "PUBLISHING", "REJECTED"].includes(c.status) ? html`<button class="btn danger" id="rej">${icon("x")}Reject</button>` : ""}
@@ -114,6 +117,28 @@ export default {
       };
       const rb = $("#rebuild");
       if (rb) rb.onclick = () => busy(rb, async () => { try { const n = await api("/api/carousels", { method: "POST", body: { topic_id: c.topic_id } }); app.go("creator", { id: n.id }); } catch (e) { toast(e.message, "err"); } });
+      const sched = $("#sched"), unsched = $("#unsched");
+      if (sched) sched.onclick = () => busy(sched, async () => {
+        const at = $("#schedAt").value;
+        if (!at) return toast("Pick a date and time (IST)", "info");
+        try { await api(`/api/carousels/${c.id}/schedule`, { method: "POST", body: { at, confirm: true } }); toast(`Scheduled for ${at.replace("T", " ")} IST`, "ok"); await load(); }
+        catch (e) { toast(e.message, "err"); }
+      });
+      if (unsched) unsched.onclick = () => busy(unsched, async () => {
+        try { await api(`/api/carousels/${c.id}/schedule`, { method: "DELETE" }); toast("Schedule cleared", "ok"); await load(); } catch (e) { toast(e.message, "err"); }
+      });
+      const recon = $("#recon");
+      if (recon) recon.onclick = () => busy(recon, async () => {
+        try {
+          const r = await api(`/api/carousels/${c.id}/reconcile`, { method: "POST" });
+          const x = (r.results || [])[0];
+          if (!x) toast(r.note, "info", 7000);
+          else if (x.result === "published") toast("Meta confirms it's live, marked Published.", "ok", 7000);
+          else if (x.result === "failed_safe_to_retry") toast("Meta confirms it did not go live. You can retry safely.", "ok", 7000);
+          else toast(`Couldn't confirm yet: ${x.error}`, "err", 9000);
+          await load();
+        } catch (e) { toast(e.message, "err"); }
+      });
       const pub = $("#pub");
       if (pub) pub.onclick = async () => {
         const m = app.state.meta;
