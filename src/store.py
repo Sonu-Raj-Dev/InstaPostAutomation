@@ -50,6 +50,9 @@ class _Result:
     def fetchone(self):
         return self._rows[0] if self._rows else None
 
+    def __iter__(self):  # sqlite3.Cursor is iterable; callers rely on it
+        return iter(self._rows)
+
 
 class Conn:
     """Same surface as sqlite3.Connection for what this app uses: execute(), commit(), context manager."""
