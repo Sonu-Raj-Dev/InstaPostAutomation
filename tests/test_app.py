@@ -65,6 +65,8 @@ def test_settings_validation_and_auto_mode_confirmation():
     assert r.status_code == 400 and get_setting("publishing_mode") == "REVIEW"
     r = client.post("/api/settings", json={"publishing_mode": "AUTO", "confirm_auto": True})
     assert r.status_code == 200 and get_setting("publishing_mode") == "AUTO"
+    r = client.post("/api/settings", json={"publishing_mode": "AUTO", "research_time": "09:40"})  # already AUTO: no re-confirm
+    assert r.status_code == 200 and get_setting("research_time") == "09:40"
     client.post("/api/settings", json={"publishing_mode": "REVIEW"})
     assert client.post("/api/settings", json={"auto_categories": "Not A Category"}).status_code == 400
 

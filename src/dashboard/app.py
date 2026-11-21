@@ -478,7 +478,7 @@ async def api_update_settings(req: Request):
             errors[k] = "Unknown setting"
         elif not VALIDATORS[k](v):
             errors[k] = "Invalid value"
-        elif k == "publishing_mode" and v == "AUTO" and not b.get("confirm_auto"):
+        elif k == "publishing_mode" and v == "AUTO" and not b.get("confirm_auto") and get_settings().get("publishing_mode") != "AUTO":
             errors[k] = "Auto Mode requires explicit confirmation"
     if errors:
         return JSONResponse(status_code=400, content={"success": False, "error": "Validation failed", "fields": errors})
