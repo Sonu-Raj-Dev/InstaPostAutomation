@@ -28,6 +28,7 @@ except Exception:
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from store import execute, get_setting, query, ts  # noqa: E402
+from meta_graph_client import _error, _scrub  # noqa: E402
 
 load_dotenv()
 logger = logging.getLogger("CommentResponder")
@@ -43,24 +44,46 @@ class CommentResponder:
     def reload(self):
         load_dotenv(override=True)
         from meta_graph_client import _saved_token
-        self.access_token = _saved_token() or os.getenv("META_ACCESS_TOKEN", "")
+        # Messaging (private replies / DMs) needs a Page access token; publishing works with the main token.
+        self.access_token = os.getenv("META_PAGE_ACCESS_TOKEN", "") or _saved_token() or os.getenv("META_ACCESS_TOKEN", "")
         self.ig_user_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "")
 
     # ---------------------------------------------------------- Graph calls (overridden in tests)
+    last_error: Dict[str, Any] = {}  # structured Meta error of the latest failed call (code, subcode, uncertain, …)
+
     def _call(self, method: str, path: str, **kw) -> Tuple[bool, Dict[str, Any]]:
+        """→ (True, data) | (False, {"error": readable text, "meta": structured error}). The token never appears in errors."""
         try:
             r = requests.request(method, f"{BASE}/{path}", timeout=20,
                                  params={**kw.pop("params", {}), "access_token": self.access_token}, **kw)
+        except requests.Timeout:
+            e = _error(0, {}, "No answer from Meta within 20s", "timeout", uncertain=True)
+            self.last_error = e
+            return False, {"error": e["message"], "meta": e}
+        except Exception as ex:
+            e = _error(0, {}, f"Network error: {_scrub(str(ex))}", "network", uncertain=True)
+            self.last_error = e
+            return False, {"error": e["message"], "meta": e}
+        try:
             data = r.json()
-        except Exception as e:
-            return False, {"error": str(e)}
-        if r.status_code == 200 and "error" not in data:
+        except ValueError:
+            data = {}
+        if r.status_code == 200 and isinstance(data, dict) and "error" not in data:
             return True, data
-        return False, {"error": (data.get("error") or {}).get("message", str(data)[:300])}
+        e = _error(r.status_code, data if isinstance(data, dict) else {}, _scrub(r.text[:300]), "meta", uncertain=r.status_code >= 500)
+        self.last_error = e
+        return False, {"error": e["message"], "meta": e}
 
     def _send(self, recipient: Dict[str, str], message: Dict[str, Any]) -> Tuple[bool, str]:
-        ok, d = self._call("POST", "me/messages", json={"recipient": recipient, "message": message})
+        self.last_error = {}
+        node = os.getenv("META_MESSAGING_NODE", "me")  # "me" with a Page token, or the Page id (see Meta configuration report)
+        ok, d = self._call("POST", f"{node}/messages", json={"recipient": recipient, "message": message})
         return ok, "" if ok else d["error"]
+
+    def get_comment(self, comment_id: str) -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
+        """Re-read a comment from Instagram: the webhook payload is never trusted on its own."""
+        ok, d = self._call("GET", comment_id, params={"fields": "id,text,timestamp,from{id,username},media{id}"})
+        return ok, d if ok else {}, {} if ok else d["meta"]
 
     @staticmethod
     def _buttons(text: str, *titles: str) -> Dict[str, Any]:
@@ -101,7 +124,11 @@ class CommentResponder:
 
     # ---------------------------------------------------------- delivery
     def deliver(self, campaign: Dict[str, Any], igsid: str) -> Tuple[bool, str]:
-        ok, err = self.send_dm(igsid, campaign.get("resource_pack") or "Here's your guide 👇")
+        text = campaign.get("resource_pack") or "Here's your guide 👇"
+        guide = (campaign.get("guide_url") or "").strip()
+        if guide and guide not in text:
+            text = f"{text}\n\nFull guide: {guide}"
+        ok, err = self.send_dm(igsid, text)
         if not ok:
             return False, err
         for url in json.loads(campaign.get("guide_images") or "[]")[:6]:
@@ -117,11 +144,11 @@ class CommentResponder:
         ok, comments, err = self.get_post_comments(campaign["media_id"])
         if not ok:
             return {"success": False, "error": f"Could not read comments: {err}"}
-        kw = re.compile(rf"\b{re.escape(campaign['keyword'].strip())}\b", re.I)
+        from automation import dm_engine
         handled = {r["comment_id"] for r in query("SELECT comment_id FROM dm_deliveries")}
         me = get_setting("connected_handle", "").lstrip("@").lower()
         who = lambda c: ((c.get("from") or {}).get("username") or c.get("username", "")).lower()  # noqa: E731
-        new = [c for c in comments if kw.search(c.get("text", "")) and c["id"] not in handled]
+        new = [c for c in comments if dm_engine.keyword_hit(campaign, c.get("text", "")) and c["id"] not in handled]
         own = [c for c in new if me and who(c) == me]  # Instagram can't DM the account itself
         matches = [c for c in new if c not in own]
         log(f"{len(comments)} comments read, {len(matches)} new keyword matches, {len(own)} of your own skipped")
@@ -132,23 +159,16 @@ class CommentResponder:
                            VALUES (?,?,?,?,'SKIPPED_SELF',?,?,?)""",
                         (campaign["id"], c["id"], who(c), c.get("text", ""),
                          "Your own comment: Instagram can't DM the account itself. Test from another account.", ts(), ts()))
-        opener = campaign.get("private_reply") or get_setting("dm_opener", "Thanks for commenting! Tap below and I'll send it.")
         report = {"success": True, "dry_run": dry_run, "comments_read": len(comments), "matches": [], "followups": [], "skipped_own": report_own}
 
         for c in matches:
             frm = c.get("from") or {}
             username, igsid = frm.get("username") or c.get("username", ""), frm.get("id", "")
             entry = {"comment_id": c["id"], "username": username, "text": c.get("text", ""), "action": f"private reply + button “{TAP_ACCESS}”"}
-            if not dry_run:
-                sent, e = self.send_private_reply(c["id"], opener)
-                status = "AWAITING_TAP" if sent else "FAILED"
-                if sent and campaign.get("public_reply_enabled") and campaign.get("public_reply_text"):
-                    self.reply_publicly(c["id"], campaign["public_reply_text"])
-                execute("""INSERT OR IGNORE INTO dm_deliveries (campaign_id, comment_id, username, igsid, comment_text,
-                           status, error, user_msgs, created_at, updated_at) VALUES (?,?,?,?,?,?,?,0,?,?)""",
-                        (campaign["id"], c["id"], username, igsid, c.get("text", ""), status, e, ts(), ts()))
-                entry.update(status=status, error=e)
-                log(f"@{username}: {status} {e}")
+            if not dry_run:  # same path as webhooks: claim the comment in the DB first, then send (no duplicates)
+                res = dm_engine.deliver_for_comment(campaign, c, responder=self)
+                entry.update(status=res["status"], error=res.get("error", ""))
+                log(f"@{username}: {res['status']} {res.get('error', '')}")
             report["matches"].append(entry)
 
         # taps: anyone who messaged us since our last message moves forward

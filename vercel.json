@@ -8,7 +8,6 @@
     { "source": "/((?!api/render$).*)", "destination": "/api/index" }
   ],
   "crons": [
-    { "path": "/api/cron/research", "schedule": "0 12 * * *" },
-    { "path": "/api/cron/pipeline", "schedule": "30 13 * * *" }
+    { "path": "/api/cron/maintenance", "schedule": "30 21 * * *" }
   ]
 }

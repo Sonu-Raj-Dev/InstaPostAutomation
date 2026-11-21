@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
 from config import DB_PATH, IST, ON_VERCEL
@@ -113,6 +113,17 @@ def execute(sql: str, args=()):
         return conn.execute(sql, args).lastrowid
 
 
+def update(sql: str, args=()) -> int:
+    """UPDATE/DELETE → rows affected. A conditional UPDATE is the atomic claim used across serverless instances."""
+    with get_db() as conn:
+        return conn.execute(sql, args).rowcount
+
+
+def utc_now() -> str:
+    """UTC ISO-8601 for timestamp columns added from v5 on (older columns keep IST wall-clock, see ts())."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def get_secret(key: str) -> str:
     """Credentials saved from the UI (e.g. a renewed Meta token). Never part of /api/settings."""
     row = one("SELECT value FROM secrets WHERE key=?", (key,))
@@ -164,14 +175,14 @@ _lock = threading.Lock()
 
 
 def start_job(kind: str, fn: Callable[[JobContext], Any], trigger: str = "manual",
-              ref_id: Optional[int] = None, background: bool = True) -> Dict[str, Any]:
+              ref_id: Optional[int] = None, background: bool = True, slot_key: str = "") -> Dict[str, Any]:
     """Run fn in a thread, recording stage/progress/log/result in the jobs table.
     One job per kind at a time (ponytail: per-kind lock; per-ref locks if parallel publishes are ever needed)."""
     with _lock:
         if kind in _running:
             return {"started": False, "error": f"A {kind} job is already running", "job_id": _running[kind]}
-        job_id = execute("INSERT INTO jobs (kind, trigger, status, started_at, ref_id) VALUES (?,?,?,?,?)",
-                         (kind, trigger, "RUNNING", ts(), ref_id))
+        job_id = execute("INSERT INTO jobs (kind, trigger, status, started_at, ref_id, slot_key) VALUES (?,?,?,?,?,?)",
+                         (kind, trigger, "RUNNING", ts(), ref_id, slot_key))
         _running[kind] = job_id
 
     def run():
@@ -198,6 +209,11 @@ def start_job(kind: str, fn: Callable[[JobContext], Any], trigger: str = "manual
     return {"started": True, "job_id": job_id}
 
 
-def recover_stale_jobs():
-    """Jobs left RUNNING by a previous process can never finish."""
-    execute("UPDATE jobs SET status='FAILED', error='Interrupted: server restarted', finished_at=? WHERE status='RUNNING'", (ts(),))
+def recover_stale_jobs(older_than_minutes: Optional[int] = None) -> int:
+    """Jobs left RUNNING by a dead process can never finish. Locally: all of them at startup.
+    Vercel: only those older than the function limit (a request can't outlive maxDuration=300 s)."""
+    if older_than_minutes is None:
+        return update("UPDATE jobs SET status='FAILED', error='Interrupted: server restarted', finished_at=? WHERE status='RUNNING'", (ts(),))
+    cutoff = (now_ist() - timedelta(minutes=older_than_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    return update("UPDATE jobs SET status='FAILED', error='Interrupted: the serverless function stopped before finishing', finished_at=? "
+                  "WHERE status='RUNNING' AND started_at < ?", (ts(), cutoff))
